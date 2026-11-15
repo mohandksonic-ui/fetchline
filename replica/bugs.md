@@ -2727,6 +2727,70 @@ Windows before, so this run also proves the BUG-031
 `.bat` fixtures end to end.
 File: `app/engine/src/antivirus.rs` + this log.
 
+## Round 29 — BUG-035: .bat `%1` keeps Rust's quotes, so the recorded path never matches — 2026-11-15
+
+### BUG-035: FIXED — fake-scanner .bat records the quoted path
+
+- Severity: S3 (test-only)
+- Flow / case: `antivirus_tests` on Windows
+- Screen: engine tests
+  (`app/engine/tests/antivirus_tests.rs`,
+  `translate_body_to_batch`)
+- Build: 2026-11-15 (found by CI run 43711988153, head
+  e16f8fb2 — the Engine tests step failed in
+  `antivirus_tests`: 16 passed, 1 failed; the log was
+  read via the user's signed-in Chrome)
+
+Steps
+1. On Windows, run `cargo test` in `app/engine`.
+2. The lib target passes 56/56 and `antivirus_tests`
+   passes 16/17. The one failure is
+   `clean_scanner_reports_clean_and_scans_the_final_path`
+   (line 166): the assertion compares the path the
+   fake scanner recorded with the finished file's
+   `save_path` — left `"C:\Users\RUNNER~1\…\clean.bin"`
+   (quoted), right `C:\Users\RUNNER~1\…\clean.bin`
+   (bare).
+
+Expected: the recorded path equals the bare path.
+Actual: the record holds the path in double quotes.
+
+Root cause: when Rust invokes a .bat file it quotes
+the argument, and in a batch file `%1` keeps those
+quotes — only `%~1` strips them. The fake scanner
+recorded `%1`, so on Windows the record always held
+the quoted path while the test expected the bare one
+(the Unix `$1` has no such quoting). The BUG-034
+fix is what exposed this: before it, the scanner
+never started at all (9 failures); with it, 16 of
+17 pass and only this quoting detail remains. The
+engine is correct here — a real .exe scanner gets
+the bare path (the C runtime strips the quotes) —
+so the fix belongs in the test fixture, not the
+engine.
+
+Fix (test-only, Windows-only code): the translator
+now emits `%~1` instead of `%1` in both places that
+carry the scanned path — the `printf` recorder line
+(`@echo %~1>> "<record>"`) and the `echo` lines
+(`$1` → `%~1`). `%~1` strips surrounding quotes
+when present and is unchanged otherwise, so it
+matches the Unix `$1` semantics exactly.
+Regression test kept: the failing test itself (it
+now asserts the bare path on both platforms).
+Verified: the translator was checked standalone
+with bare rustc (all 6 body shapes translate
+exactly, `%~1` everywhere); `cargo test --test
+antivirus_tests` 17/17 pass on Linux (unchanged
+behaviour there — the changed code is
+`#[cfg(windows)]` only); `cargo check --tests` 0
+warnings. Windows proof is the CI run after the
+push — if it goes green, the Engine tests step is
+finally past and the host build, Tauri build, smoke
+test and reworked capture job run for the first time
+on this workflow.
+File: `app/engine/tests/antivirus_tests.rs` + this log.
+
 ## Known limitations, not bugs (round-24 additions)
 
 - The Tauri shell never compiles or runs on this VM, so a

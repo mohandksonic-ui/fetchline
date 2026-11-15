@@ -77,8 +77,13 @@ fn translate_body_to_batch(body: &str) -> String {
             continue;
         }
         if let Some(record) = line.strip_prefix("printf '%s\\n' \"$1\" >> ") {
-            // Recorder: write the scanned path (%1) into the record file.
-            out.push_str(&format!("@echo %1>> \"{}\"\n", record.trim()));
+            // Recorder: write the scanned path into the record
+            // file. `%~1` (not `%1`): Rust quotes the argument
+            // when it invokes a .bat, and `%1` keeps those
+            // quotes while `%~1` strips them — the recorded
+            // path must be the bare path, as `$1` is on Unix
+            // (BUG-035: the record held `"C:\…\file.bin"`).
+            out.push_str(&format!("@echo %~1>> \"{}\"\n", record.trim()));
         } else if let Some(secs) = line.strip_prefix("sleep ") {
             // `timeout` refuses redirected stdin (the engine runs
             // the scanner with stdin nulled); ping is the classic
@@ -88,7 +93,9 @@ fn translate_body_to_batch(body: &str) -> String {
         } else if let Some(code) = line.strip_prefix("exit ") {
             out.push_str(&format!("exit /b {}\n", code.trim()));
         } else if let Some(rest) = line.strip_prefix("echo ") {
-            let rest = rest.replace("$1", "%1");
+            // `%~1` strips the quotes Rust adds when invoking
+            // a .bat (see the recorder above, BUG-035).
+            let rest = rest.replace("$1", "%~1");
             let rest = rest
                 .strip_prefix('"')
                 .and_then(|r| r.strip_suffix('"'))
