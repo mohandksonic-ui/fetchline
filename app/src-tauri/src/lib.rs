@@ -25,6 +25,65 @@ pub struct AppState {
     pub manager: Arc<DownloadManager>,
 }
 
+// ---------------------------------------------------------------------------
+// Startup diagnostics (BUG-029). The first Windows build launches to a
+// blank white window and exits after ~1-2 s with no error dialog and no
+// Windows Error Reporting entry, so the launch failure is invisible.
+// Everything below writes to `startup.log` next to the database
+// (`%APPDATA%\com.fetchline.app\fetchline\startup.log` on Windows).
+// Logging is best-effort only: it never panics, never returns an error,
+// and never changes what the app does — if logging itself fails, the app
+// simply carries on without a log line.
+// ---------------------------------------------------------------------------
+
+/// Log path usable once an AppHandle exists.
+fn startup_log_path_from_app(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|dir| dir.join("fetchline").join("startup.log"))
+}
+
+/// Log path usable before any AppHandle exists (the panic hook, and the
+/// first lines of `run()`): on Windows `%APPDATA%` holds the same
+/// `%APPDATA%\com.fetchline.app\fetchline\startup.log`; anywhere else the
+/// temp dir is the fallback so the hook never has nowhere to write.
+fn startup_log_path_early() -> std::path::PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        if !appdata.is_empty() {
+            return std::path::PathBuf::from(appdata)
+                .join("com.fetchline.app")
+                .join("fetchline")
+                .join("startup.log");
+        }
+    }
+    std::env::temp_dir().join("fetchline-startup.log")
+}
+
+/// Append one `[epoch-seconds] message` line to the log file. Creates
+/// the parent directory if needed. Infallible by design.
+fn startup_log_line(path: &std::path::Path, msg: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{secs}] {msg}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Append one line when a log path is known; a `None` path logs nothing.
+fn log_startup(path: Option<&std::path::Path>, msg: &str) {
+    if let Some(p) = path {
+        startup_log_line(p, msg);
+    }
+}
+
 fn db_path(app: &AppHandle) -> Result<std::path::PathBuf, tauri::Error> {
     app.path()
         .app_data_dir()
@@ -34,8 +93,24 @@ fn db_path(app: &AppHandle) -> Result<std::path::PathBuf, tauri::Error> {
 /// Build the manager. The database file lives in the OS app-data folder
 /// (`%APPDATA%/fetchline/app.db` on Windows).
 fn build_manager(app: &AppHandle) -> Result<Arc<DownloadManager>, String> {
-    let path = db_path(app).map_err(|e| e.to_string())?;
-    let store = Arc::new(Store::open(&path).map_err(|e| e.to_string())?);
+    let log = startup_log_path_from_app(app);
+    let log = log.as_deref();
+    let path = match db_path(app) {
+        Ok(p) => p,
+        Err(e) => {
+            log_startup(log, &format!("db_path failed: {e}"));
+            return Err(e.to_string());
+        }
+    };
+    log_startup(log, &format!("db_path ok: {}", path.display()));
+    let store = match Store::open(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            log_startup(log, &format!("store open failed: {e}"));
+            return Err(e.to_string());
+        }
+    };
+    log_startup(log, "store opened");
     // 8 connections is the schema default; the stored settings are
     // applied in `setup` (apply_settings), which also wires the
     // saved proxy, speed limit and retry count.
@@ -372,7 +447,18 @@ async fn get_pending_action(
 
 #[tauri::command]
 async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
-    state.manager.get_settings().map_err(|e| e.to_string())
+    let settings = state.manager.get_settings().map_err(|e| e.to_string())?;
+    // BUG-029: the frontend calls this once on mount, so the first
+    // success proves the webview loaded and reached the backend.
+    // Logged once per process — settings are re-read often.
+    static FRONTEND_SEEN: std::sync::Once = std::sync::Once::new();
+    FRONTEND_SEEN.call_once(|| {
+        startup_log_line(
+            &startup_log_path_early(),
+            "frontend reached backend: get_settings ok",
+        );
+    });
+    Ok(settings)
 }
 
 /// Save the settings and apply them live (connection count, speed
@@ -650,12 +736,57 @@ async fn list_grabber_projects(state: State<'_, AppState>) -> Result<Vec<Grabber
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    // BUG-029: a panic on the main thread exits silently in a
+    // `windows_subsystem` release build (no console, no WER entry),
+    // so record every panic — payload and location — in the startup
+    // log. The hook resolves the log path from the environment
+    // because a panic can happen before any AppHandle exists, and
+    // it never panics itself: all IO is best-effort, and the message
+    // also goes to stderr so nothing is lost where a console exists.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let line = format!("PANIC at {location}: {payload}");
+        startup_log_line(&startup_log_path_early(), &line);
+        eprintln!("{line}");
+    }));
+    startup_log_line(&startup_log_path_early(), "main entered");
+    match tauri::webview_version() {
+        Ok(v) => startup_log_line(
+            &startup_log_path_early(),
+            &format!("webview version: {v}"),
+        ),
+        Err(e) => startup_log_line(
+            &startup_log_path_early(),
+            &format!("webview version: ERROR {e:?}"),
+        ),
+    }
+    let result = tauri::Builder::default()
         .setup(|app| {
-            let manager = build_manager(app.handle())?;
+            let log = startup_log_path_from_app(app.handle());
+            let log = log.as_deref();
+            log_startup(log, "setup start");
+            let manager = match build_manager(app.handle()) {
+                Ok(m) => m,
+                Err(e) => {
+                    log_startup(log, &format!("build_manager failed: {e}"));
+                    return Err(e);
+                }
+            };
+            log_startup(log, "manager built");
             // Apply the stored settings (connection count, speed
             // cap, proxy, retries) before any download starts.
             let _ = manager.apply_settings();
+            log_startup(log, "settings applied");
             // Forward engine progress events to the frontend.
             let handle = app.handle().clone();
             let mut rx = manager.subscribe();
@@ -708,7 +839,9 @@ pub fn run() {
             tokio::spawn(async move {
                 let _ = startup_manager.start_startup_queues().await;
             });
+            log_startup(log, "spawns done");
             app.manage(AppState { manager });
+            log_startup(log, "setup ok");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -774,6 +907,18 @@ pub fn run() {
             test_sound_file,
             update_category
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!());
+    // BUG-029: `.run()` only returns when the app exits. Record the
+    // outcome first — a run error used to die in `.expect` with
+    // nothing on disk — then keep the exact same panic behaviour.
+    match result {
+        Ok(()) => startup_log_line(&startup_log_path_early(), "run returned ok"),
+        Err(e) => {
+            startup_log_line(
+                &startup_log_path_early(),
+                &format!("run failed: {e}"),
+            );
+            panic!("error while running tauri application");
+        }
+    }
 }

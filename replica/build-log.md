@@ -2243,3 +2243,37 @@ check and download quota untouched, as instructed.
   after the push is the proof. Pushed the changed files only via
   the connector; the push re-triggers the workflow. Licence (S11)
   untouched.
+
+## BUG-029 — First real Windows launch fails silently: startup diagnostics added — 2026-11-15
+- The run-#5 MSI installs fine, but on the user's real PC the app
+  shows a blank white window for ~1-2 s and closes — no error
+  dialog, no WER / Application Error event (Event Viewer shows
+  only unrelated CAPI2 errors). `app.db` exists (156 KB, first
+  launch), so setup got past the database. No `process::exit`,
+  no frontend close, scheduler tick is a no-op on a fresh DB.
+  Root cause still UNKNOWN after several rounds of guessing, so
+  this round stops guessing and instruments the app (diagnostics
+  only, no behaviour change).
+- Fix: `app/src-tauri/src/lib.rs` now writes an append-only
+  `startup.log` next to the database
+  (`%APPDATA%\com.fetchline.app\fetchline\startup.log`) with
+  milestones (main entered, webview version or ERROR, setup
+  start, db_path ok, store opened, manager built, settings
+  applied, spawns done, setup ok, run returned ok, plus a
+  once-per-process "frontend reached backend: get_settings ok"
+  from the existing `get_settings` command). A panic hook at the
+  start of `run()` appends panic payload + location to the same
+  file (path from `APPDATA`, temp-dir fallback; hook cannot panic,
+  also prints to stderr). A run error is logged before the same
+  panic as before. All std-only, best-effort logging.
+- Verified: std-only helpers checked with a `rustc -D warnings`
+  stub (`/tmp/bug029/` — exact extracted functions compile clean
+  and behave as designed); Tauri-side signatures verified
+  against vendored tauri 2.12.5 (`webview_version` re-export,
+  `Builder::run -> Result<()>`, setup `Result<(), Box<dyn
+  Error>>`). Full suite 411/411 pass, `cargo check --tests` 0
+  warnings, `npm run build` passes, parity unchanged 85.4/100
+  (must-haves 17/17). Tauri lib still uncheckable on this VM —
+  the CI run after the push is the proof. Next step is the user
+  installing this build, launching once, and sending the
+  `startup.log`. Licence (S11) untouched.

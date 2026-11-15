@@ -2164,3 +2164,90 @@ File: `app/src-tauri/src/lib.rs` (one-line signature fix),
   standalone `rustc -D warnings` stub of the exact code pattern
   (old pattern reproduces the warning, new pattern is clean),
   and the real proof is a warning-free step 9 on the CI runner.
+
+## Round 22 — First real Windows launch fails silently (CI run #5 installer) — 2026-11-15
+
+### BUG-029: Installed app shows a blank white window for ~1-2 s, then closes — no error, no crash record
+
+- Severity: S1
+- Flow / case: app launch, first run on real Windows
+- Screen: S01 (shell: `app/src-tauri/src/lib.rs`)
+- Build: 2026-11-15 (CI run #5, 43678007493, commit f3736b84; MSI
+  installed on the user's real Windows PC)
+
+Steps
+1. Install the MSI from the run-#5 artifact
+   (`fetchline-windows-installer`) on a real Windows PC.
+2. Launch Fetchline (Start menu or the installed exe).
+3. A blank white window appears for ~1-2 s, then closes. No error
+   dialog, no message of any kind.
+
+Expected: the Fetchline window opens and stays open with the
+download list.
+Actual: the window closes by itself after ~1-2 s, every launch.
+Evidence: `%APPDATA%\com.fetchline.app\fetchline\app.db` EXISTS
+(156 KB, created 11/15/2026 6:59 AM, the first launch), so
+`Store::open` succeeded and `setup` got past the database.
+Event Viewer (Application log) shows no Application Error /
+Windows Error Reporting entry for Fetchline at launch time —
+only unrelated CAPI2 certificate errors (Event 4176). Code
+already checked: no `process::exit`, no frontend `window.close`,
+window config normal (1100x700, title Fetchline),
+`scheduler_tick` does nothing on a fresh DB,
+`DownloadManager::new` only panics if the reqwest fallback
+client fails to build. The user sent a screen recording of the
+launch (blank white window, then close).
+Suspected cause: STILL UNKNOWN. Two candidates remain: (a) a
+main-thread panic that exits cleanly with code 101 — invisible
+with `windows_subsystem = "windows"` and no WER entry; (b) the
+WebView2 renderer failing and taking the window down. Several
+rounds of guessing produced no answer, so this round instruments
+the app instead of guessing again.
+Status: OPEN — diagnostics added, root cause unknown until the
+user runs the instrumented build and sends its log. Fix
+(diagnostics only, no behaviour change): `app/src-tauri/src/lib.rs`
+now writes an append-only `startup.log` next to the database
+(`%APPDATA%\com.fetchline.app\fetchline\startup.log`) with
+milestones — "main entered", "webview version: {v or ERROR}",
+"setup start", "db_path ok: {path}", "store opened",
+"manager built", "settings applied", "spawns done", "setup ok",
+"run returned ok", and "frontend reached backend: get_settings
+ok" (logged once, from the existing `get_settings` command the
+frontend already calls on mount — no new command). A panic hook
+installed at the very start of `run()` appends the panic payload
++ location to the same file (path resolved from the `APPDATA`
+env var, temp-dir fallback; the hook itself cannot panic, and
+also prints to stderr). A run error is now logged before the
+same panic as before (`.expect` replaced with a match that logs
+"run failed: {e}" first). All logging is best-effort std-only
+(`OpenOptions` append + create, `create_dir_all`); a logging
+failure never affects the app.
+Regression test kept: the std-only helpers were verified with a
+standalone `rustc -D warnings` stub (`/tmp/bug029/`): the exact
+extracted functions compile clean, append lines with epoch
+timestamps, log a caught test panic with payload + location,
+and log nothing for a `None` path. The Tauri-side wiring
+(`webview_version` re-export, `Builder::run -> Result<()>`,
+setup closure `Result<(), Box<dyn Error>>`) was verified
+against the vendored tauri 2.12.5 source.
+Verified: full suite 411/411 pass, 0 failed; `cargo check
+--tests` 0 warnings; `npm run build` passes; parity unchanged
+85.4/100 (must-haves 17/17). Windows cross-check still blocked
+on this VM (no MinGW gcc; Tauri lib uncheckable here) — the CI
+run after the push is the proof. The next step is the user
+installing the instrumented build, launching once, and sending
+`%APPDATA%\com.fetchline.app\fetchline\startup.log`.
+File: `app/src-tauri/src/lib.rs` (diagnostics only).
+
+## Known limitations, not bugs (round-22 additions)
+
+- The root cause of the launch failure is still unknown; this
+  round only instruments it. The diagnosis depends on the
+  `startup.log` from the user's next launch of the instrumented
+  build.
+- The user refuses command-line / PowerShell steps, so all
+  further diagnosis must come from the app itself or from plain
+  GUI steps (install, launch, send a file).
+- The diagnostics code lives in the Tauri shell, which never
+  compiles on this VM; its only proof is the CI run after the
+  push.
