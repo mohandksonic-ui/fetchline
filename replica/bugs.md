@@ -2654,6 +2654,79 @@ start-instances` if SSM access is needed again.
 File: `app/engine/tests/engine_tests.rs`,
 `app/engine/tests/options_tests.rs` + this log.
 
+## Round 28 — BUG-034: scanner command splitter strips Windows path backslashes — 2026-11-15
+
+### BUG-034: FIXED — `split_command` mangled every unquoted Windows path
+
+- Severity: S2 (real engine bug, not test-only)
+- Flow / case: antivirus scan (S14) on Windows, any
+  scanner command with an unquoted Windows path
+- Screen: engine (`app/engine/src/antivirus.rs`,
+  `split_command` + `build_command`)
+- Build: 2026-11-15 (found by CI run 43710597692, head
+  2d41441 — the Engine tests step failed in
+  `antivirus_tests`: 8 passed, 9 failed; the log was
+  read via the user's signed-in Chrome)
+
+Steps
+1. On Windows, run `cargo test` in `app/engine`.
+2. The lib target passes 56/56. Then `antivirus_tests`
+   fails 9 of 17 — every test that actually runs the
+   fake scanner: `clean_scanner_reports_clean_and_scans_the_final_path`,
+   `exit_zero_with_a_threat_in_the_output_is_still_infected`,
+   `manual_rescan_after_completion_records_a_new_result`,
+   `quarantine_is_refused_for_a_clean_file`,
+   `run_scan_timeout_kills_a_sleeping_scanner_quickly`,
+   `scan_does_not_block_completion_and_a_slow_scanner_times_out`,
+   `scan_result_is_persisted_across_a_store_reopen`,
+   `settings_round_trip_and_test_button_use_the_fake_scanner`,
+   `threat_scanner_reports_infected_and_nothing_is_auto_deleted_or_opened`.
+   All 9 carry the same detail: `Could not start the
+   antivirus scanner: program not found. Check the
+   command in Settings.` The 8 passing tests are the
+   ones that never spawn a scanner (validation,
+   not-configured, missing scanner, …).
+
+Expected: the fake scanner runs and the tests see
+`clean` / `infected` / `timed_out`.
+Actual: the spawn fails before the scanner ever runs.
+
+Root cause: `split_command` treated a backslash
+OUTSIDE quotes as an escape for the next character and
+dropped it. The tests set the scanner command
+unquoted — `C:\Users\…\clean.bat {file}` — so every
+backslash was stripped and the program token became
+`C:Users…clean.bat`, with no path separator left.
+Rust's Windows spawn then does a PATH search, finds
+nothing, and fails with its own "program not found"
+error. The existing unit test only covered a QUOTED
+path (`"C:\Program Files\Scanner\scan.exe" …`),
+where backslashes were already preserved, so the
+unquoted case was never exercised. This is a real
+product bug, not a test artifact: any user who typed
+an unquoted Windows scanner path in Settings would
+get the same "Could not start" failure (Linux paths
+use `/`, so it never showed up there).
+
+Fix (engine): the backslash arm now escapes the next
+character only when that character needs escaping —
+inside double quotes a quote or another backslash;
+outside quotes a quote, another backslash, or a
+space. Anything else keeps the backslash. The quoted
+and single-quoted behaviour is unchanged. Regression
+test kept: `split_command_handles_quotes_and_spaces`
+now also asserts the exact failing shape —
+`C:\Scanner\scan.exe {file}` splits to the intact
+path plus `{file}`.
+Verified: full engine suite **413/413 pass, 0 failed**
+on Linux (lib 56, antivirus 17, engine_tests 112,
+all other targets green), `cargo check --tests` 0
+warnings. Windows proof is the CI run after the
+push — the antivirus suite has never passed on
+Windows before, so this run also proves the BUG-031
+`.bat` fixtures end to end.
+File: `app/engine/src/antivirus.rs` + this log.
+
 ## Known limitations, not bugs (round-24 additions)
 
 - The Tauri shell never compiles or runs on this VM, so a

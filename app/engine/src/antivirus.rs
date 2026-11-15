@@ -190,12 +190,27 @@ pub fn split_command(template: &str) -> Result<Vec<String>> {
                 has_token = true;
             }
             '\\' if !in_single => {
-                // Outside quotes a backslash escapes the next char;
-                // inside double quotes it escapes only `"` and `\`
-                // (a Windows path like `C:\Scanner\scan.exe` keeps
-                // its backslashes).
+                // A backslash escapes the next char only when
+                // that char needs escaping. Inside double quotes
+                // that is a quote or another backslash; outside
+                // quotes it is a quote, another backslash, or a
+                // space. Anything else keeps the backslash —
+                // an unquoted Windows path like
+                // `C:\Scanner\scan.exe` must keep its
+                // backslashes (BUG-034: every one was stripped,
+                // so the scanner program could never be found
+                // on Windows and every scan failed at spawn).
                 match chars.peek() {
                     Some(&next) if in_double && next != '"' && next != '\\' => {
+                        cur.push('\\');
+                    }
+                    Some(&next)
+                        if !in_double
+                            && next != '"'
+                            && next != '\''
+                            && next != '\\'
+                            && !next.is_whitespace() =>
+                    {
                         cur.push('\\');
                     }
                     Some(&next) => {
@@ -483,6 +498,13 @@ mod tests {
             vec!["scan.exe", "--file", "{file}"]
         );
         assert_eq!(split_command("  scan.exe   -q  ").unwrap(), vec!["scan.exe", "-q"]);
+        // BUG-034: an unquoted Windows path keeps its backslashes
+        // (the old code stripped every one, so the program could
+        // never be found and every scan failed at spawn).
+        assert_eq!(
+            split_command(r#"C:\Scanner\scan.exe {file}"#).unwrap(),
+            vec![r#"C:\Scanner\scan.exe"#.to_string(), "{file}".to_string()]
+        );
         assert!(split_command("").is_err());
         assert!(split_command("\"unterminated").is_err());
     }
