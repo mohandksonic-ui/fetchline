@@ -2215,3 +2215,31 @@ check and download quota untouched, as instructed.
   disconnect + reconnect) — the push re-triggers the workflow.
   No workflow change was needed (the failure was product code,
   not the workflow). Licence (S11) untouched.
+
+## BUG-028 — Second Windows build failure (CI run 43676557208) — 2026-11-15
+- Step 8 "Engine tests" went green on Windows (BUG-027 proven
+  fixed), but step 9 failed again at a later stage: a single Rust
+  error, `error[E0425]: cannot find type 'Result' in module
+  'std::path'` at `app/src-tauri/src/lib.rs:28` — `db_path`
+  declared `std::path::Result`, which does not exist.
+  `app_data_dir()` returns `Result<PathBuf, tauri::Error>`.
+  The typo survived because the Tauri lib never compiles on the
+  Linux VM (missing `gdk-3.0`); rustc only reported it once
+  BUG-027 was out of the way.
+- Fix: `db_path` now returns `Result<std::path::PathBuf,
+  tauri::Error>`; behaviour unchanged. Whole Tauri shell
+  (`lib.rs` 779 lines + `main.rs`) audited — no other wrong type,
+  missing import or bad path (the run-4 log showed this single
+  error). Also cleaned the two remaining Windows-only warnings:
+  kerberos.rs `in_buf` dead assignment (now built in one
+  `input_token.map(...)` assignment; verified with a `rustc -D
+  warnings` stub — old pattern reproduces the warning, new one
+  is clean) and the unused `FreeContextBuffer` FFI declaration
+  (removed — SSPI never allocates a buffer for us).
+- Verified: full suite 411/411 pass, `cargo check --tests` 0
+  warnings, `npm run build` passes, parity unchanged 85.4/100
+  (must-haves 17/17). Windows cross-check still blocked on this
+  VM (MinGW gcc missing; Tauri lib uncheckable here) — the CI run
+  after the push is the proof. Pushed the changed files only via
+  the connector; the push re-triggers the workflow. Licence (S11)
+  untouched.

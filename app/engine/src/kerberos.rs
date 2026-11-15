@@ -549,12 +549,14 @@ impl Drop for GssInitiator {
 
 // ---------------------------------------------------------------------------
 // SSPI (Windows) — direct FFI to secur32, mirroring secret.rs' DPAPI FFI.
-// Written, not compiled here: the Tauri shell does not build on this
-// Linux VM, so this module has never been compiled. Signatures follow
-// the documented Win32 SSPI API (AcquireCredentialsHandleA /
+// Never compiled on this Linux VM (the Tauri shell does not build
+// here), but the engine — this module included — compiled on the
+// Windows CI runner in run #4. Signatures follow the documented
+// Win32 SSPI API (AcquireCredentialsHandleA /
 // InitializeSecurityContextA / FreeCredentialsHandle /
-// DeleteSecurityContext / FreeContextBuffer); the first Windows
-// build must compile it before Kerberos can be claimed on Windows.
+// DeleteSecurityContext). `FreeContextBuffer` is deliberately NOT
+// declared: SSPI never allocates a buffer for us (the output buffer
+// is our own `Vec`), so there is nothing for it to free.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
@@ -620,7 +622,6 @@ mod sspi {
         ) -> i32;
         pub fn FreeCredentialsHandle(ph_credential: *mut SecHandle) -> i32;
         pub fn DeleteSecurityContext(ph_context: *mut SecHandle) -> i32;
-        pub fn FreeContextBuffer(pv_context_buffer: *mut c_void) -> i32;
     }
 
     /// `SECPKG_CRED_OUTBOUND`.
@@ -692,18 +693,18 @@ impl SspiInitiator {
 impl SpnegoInitiator for SspiInitiator {
     fn step(&mut self, input_token: Option<&[u8]>) -> Result<SpnegoStep> {
         use sspi::*;
-        // Input token, when the proxy sent one. The buffer is only
-        // built when a token exists, so there is no placeholder
-        // assignment that is never read (BUG-027 warning fix).
-        let mut in_buf: Option<SecBuffer> = None;
+        // Input token, when the proxy sent one. The buffer is built
+        // from the token in a single assignment, so no value is ever
+        // assigned and never read (BUG-028 warning fix).
+        let mut in_buf: Option<SecBuffer> = input_token.map(|token| SecBuffer {
+            cb_buffer: token.len() as u32,
+            buffer_type: SECBUFFER_TOKEN,
+            pv_buffer: token.as_ptr() as *mut std::ffi::c_void,
+        });
         let mut in_desc = SecBufferDesc { ul_version: SECBUFFER_VERSION, c_buffers: 0, p_buffers: std::ptr::null_mut() };
-        if let Some(token) = input_token {
-            in_buf = Some(SecBuffer {
-                cb_buffer: token.len() as u32,
-                buffer_type: SECBUFFER_TOKEN,
-                pv_buffer: token.as_ptr() as *mut std::ffi::c_void,
-            });
-            in_desc = SecBufferDesc { ul_version: SECBUFFER_VERSION, c_buffers: 1, p_buffers: in_buf.as_mut().unwrap() };
+        if let Some(buf) = in_buf.as_mut() {
+            in_desc.c_buffers = 1;
+            in_desc.p_buffers = buf;
         }
         // Output buffer: Kerberos tokens fit in 16 KiB in practice;
         // SEC_E_INSUFFICIENT_MEMORY would surface as an error below.

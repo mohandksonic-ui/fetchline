@@ -2082,3 +2082,85 @@ upload is the proof. File: `app/engine/src/manager.rs`
   compiles the same lib), but Windows *runtime* test failures
   beyond compilation cannot be ruled out until a green CI run
   shows the step passing.
+
+## Round 21 — Second Windows build failure (CI run 43676557208) — 2026-11-15
+
+### BUG-028: `std::path::Result` typo in the Tauri shell breaks the Windows build — 1 compile error in `fetchline`
+
+- Severity: S2
+- Flow / case: app startup (`db_path` / `build_manager`), CI Windows build
+- Screen: S01 (shell: `app/src-tauri/src/lib.rs`)
+- Build: 2026-11-15 (GitHub Actions Windows build, run 43676557208, job 132697870091)
+
+Steps
+1. Push the repo to GitHub; the `Build Windows installer` workflow
+   runs on `windows-latest`.
+2. The frontend builds fine ("vite built in 4.02s") and the engine
+   tests pass (step 8 green — BUG-027 is fixed).
+3. Step 9 (`npx --yes @tauri-apps/cli@2 build`, working dir `app`)
+   fails compiling the Tauri shell.
+
+Expected: the Tauri shell compiles and the MSI + NSIS installer is
+produced.
+Actual: 1 error in `app/src-tauri/src/lib.rs:28`:
+`error[E0425]: cannot find type 'Result' in module 'std::path'` —
+`fn db_path(app: &AppHandle) -> std::path::Result<std::path::PathBuf>`.
+There is no `Result` in `std::path`; `app_data_dir()` returns
+`Result<PathBuf, tauri::Error>`. Packaging was never reached.
+Evidence: CI run 43676557208 step 9 log tail, read from the user's
+signed-in browser (exit code 1, 4m 21s); the log shows this single
+Rust error — no other compile error, no packaging error.
+Suspected cause: a typo written when the shell was first authored.
+It survived because the Tauri lib never compiles on the Linux VM
+(missing `gdk-3.0`; no apt fix attempted) — the shell had never
+been compiled anywhere before CI run #4, and rustc only reports
+the errors it reaches, so this one surfaced only after BUG-027
+was fixed.
+Status: FIXED. `db_path` now returns
+`Result<std::path::PathBuf, tauri::Error>` — plain
+`std::result::Result` with the `tauri::Error` error type, matching
+what `app_data_dir()` returns. Behaviour is unchanged (same path,
+same `.map_err(|e| e.to_string())?` in `build_manager`). The whole
+Tauri shell (`lib.rs`, 779 lines, and `main.rs`) was audited: no
+other wrong type, missing import or bad path — and the run-4 log
+is the evidence, since rustc reports every error in the crate and
+this was the only one. Two remaining Windows-only warnings from
+the run-4 log were also cleaned, with no `#[allow]`: (a)
+kerberos.rs `in_buf` still assigned-but-never-read — the BUG-027
+restructure (`Option<SecBuffer>` initialised to `None`) still
+warned, so the buffer is now built in a single assignment
+(`input_token.map(...)`) and the descriptor is patched only when
+the buffer exists; (b) `FreeContextBuffer` was declared in the
+SSPI FFI block but never used — removed, because SSPI never
+allocates a buffer for us (the output buffer is our own `Vec`),
+so there is nothing for it to free; the module header comment was
+corrected to say the same and to note the engine has now compiled
+on the Windows CI runner.
+Regression test kept: none for the one-line type fix itself (it
+is a compile error — the CI build is the test). For the warning
+fix, a standalone stub of the exact `step()` prologue was compiled
+with `rustc -D warnings`: the old pattern fails with the same
+`unused_assignments` error, the new pattern compiles clean and
+runs correctly for `Some` and `None` tokens (`/tmp/bug028/`).
+Verified: full suite 411/411 pass, 0 failed; `cargo check
+--tests` 0 warnings; `npm run build` passes; parity unchanged
+85.4/100 (must-haves 17/17). Windows cross-check attempted again
+and still blocked on this VM (`cargo check --target
+x86_64-pc-windows-gnu -p fetchline-engine` fails in `cc-rs`:
+`failed to find tool "x86_64-w64-mingw32-gcc"` — no MinGW
+compiler; the Tauri lib itself cannot be checked here at all
+(`cargo check -p fetchline` fails on the missing `gdk-3.0`).
+File: `app/src-tauri/src/lib.rs` (one-line signature fix),
+`app/engine/src/kerberos.rs` (warning fixes + comment).
+
+## Known limitations, not bugs (round-21 additions)
+
+- The Tauri shell has still never compiled on this VM; the fix
+  is proven only by the CI run after the push. If step 9 fails
+  again, its log must come from the user's signed-in browser
+  (the logs API returns 403 without sign-in).
+- The kerberos.rs warning fixes are cfg(windows)-only, so they
+  never compile on Linux; the restructure was verified with a
+  standalone `rustc -D warnings` stub of the exact code pattern
+  (old pattern reproduces the warning, new pattern is clean),
+  and the real proof is a warning-free step 9 on the CI runner.

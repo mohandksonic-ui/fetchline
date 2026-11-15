@@ -25,7 +25,7 @@ pub struct AppState {
     pub manager: Arc<DownloadManager>,
 }
 
-fn db_path(app: &AppHandle) -> std::path::Result<std::path::PathBuf> {
+fn db_path(app: &AppHandle) -> Result<std::path::PathBuf, tauri::Error> {
     app.path()
         .app_data_dir()
         .map(|dir| dir.join("fetchline").join("app.db"))
