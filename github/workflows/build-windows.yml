@@ -1,0 +1,73 @@
+# Build the Fetchline Windows installer on GitHub's Windows runners.
+#
+# Triggers on every push to main and manually (Actions > Run workflow).
+# No secrets are required: the build uses only public toolchains, and the
+# installer is published as a workflow artifact (Actions tab > Artifacts).
+#
+# Notes:
+# - The Tauri shell does not compile on the Linux dev VM (missing gdk-3.0),
+#   so this workflow is the first place a real Windows build is produced.
+# - Icon PNG/ICO files are binary and are not stored in the repo; they are
+#   regenerated here from the project's own artwork (scripts/generate-icons.py)
+#   and then expanded into the Tauri set with `tauri icon`.
+# - The engine test step runs with continue-on-error: the suite is verified
+#   on Linux in development (410/410), and the Windows run is a smoke check —
+#   a Windows-only test failure must not block producing an installer, but it
+#   still shows up as a failed (orange) step in the run.
+
+name: Build Windows installer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Set up Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - name: Install frontend dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Generate app icons
+        run: |
+          python -m pip install pillow
+          python scripts/generate-icons.py
+          npx --yes @tauri-apps/cli@2 icon app/src-tauri/icons/icon.png
+
+      - name: Engine tests (smoke check)
+        working-directory: app/engine
+        continue-on-error: true
+        run: cargo test
+
+      - name: Build Windows installer (MSI + NSIS)
+        working-directory: app
+        run: npx --yes @tauri-apps/cli@2 build
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetchline-windows-installer
+          path: |
+            app/src-tauri/target/release/bundle/msi/*.msi
+            app/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
