@@ -75,9 +75,17 @@ impl ManifestServer {
 }
 
 fn tmpdir() -> std::path::PathBuf {
+    // BUG-041: the counter disambiguates two tests that call this
+    // in the same nanosecond tick (parallel tests in one binary
+    // share the PID, and the Windows clock tick can repeat a
+    // nanos value) — without it two tests opened the SAME fresh
+    // app.db and the loser failed Store::open with "database is
+    // locked". Same shape as common::tmpdir (BUG-040).
+    static N: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "fetchline-test-update-{}-{}",
+        "fetchline-test-update-{}-{}-{}",
         std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst),
         now_unix_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();

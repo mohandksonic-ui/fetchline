@@ -326,6 +326,34 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        // BUG-041: two connections opening the same fresh database
+        // at the same time raced inside execute_batch below (the
+        // schema WRITES: CREATE TABLE + INSERT OR IGNORE), and the
+        // loser failed instantly with SQLITE_BUSY ("database is
+        // locked") because no busy timeout was set. A transient
+        // lock must wait, not fail: 5 s is far longer than any
+        // schema/migration write, far shorter than a user would
+        // notice. This must be set before any statement runs.
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        // WAL is what this module's header already claims ("WAL
+        // mode") — it lets readers proceed while a writer holds
+        // the database, which is also what the native host needs
+        // when it opens the same app.db while the app is running.
+        // But it is BEST EFFORT, not required: changing the
+        // journal mode needs an exclusive lock and SQLite does
+        // NOT wait out contention for it (the busy handler is
+        // not consulted — proven by probe: the pragma itself
+        // returns SQLITE_BUSY under a race). WAL is an
+        // optimisation, so a busy database keeps whatever mode
+        // it already has and the open still succeeds; the
+        // busy_timeout above protects every later statement.
+        // Any other error from the pragma is real and propagates.
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => {}
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy => {}
+            Err(e) => return Err(e.into()),
+        }
         conn.execute_batch(SCHEMA_SQL)?;
         Self::migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })

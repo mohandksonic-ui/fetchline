@@ -3077,10 +3077,21 @@ empty list. Regression test kept: the two failing tests
 themselves.
 Verified: `cargo check --tests` 0 warnings; grabber_tests
 5× 28/28; full engine suite 413/413 on Linux. VPS
-verification (full suite --no-fail-fast at the new head,
-plus a leftover-directory count in the VPS TEMP and a
-PID-reuse probe to confirm the mechanism on real Windows)
-to follow; instance stopped after.
+verification (head 63bda459, confirmed by `rev-parse` on
+the instance; --no-fail-fast): **412/412 PASSED, 0
+failed**; both fixed tests ok in the log. Log:
+~/workspace/vps-test-evidence/bug040-full-suite.log
+(30,666 bytes) + S3
+s3://fetchline-vps-evidence-ce1331eb/bug040-full-suite.log.
+Mechanism checks on real Windows: the PID-reuse probe
+spawned 300 short-lived processes and saw only 253
+distinct PIDs — 47 PIDs reused — so PID reuse is real and
+fast on Windows. Leftover `fetchline-test-*` directories
+in TEMP after this run: 0 — the `remove_dir_all` race
+does not lose every run, which is exactly why the CI
+failure is intermittent (it needs a reuse landing on a
+stale directory whose downloads table is non-empty).
+Instance stopped after.
 
 
 ### BUG-039: FIXED — the test asserts the drain queue is empty the instant the status flips to "complete", before the runner removes the file
@@ -3140,6 +3151,97 @@ run 5 times consecutively on Linux, all green; full engine
 suite on Linux 413/413 pass. Windows proof is the VPS
 full-suite re-run after the push.
 File: `app/engine/tests/sync_tests.rs` + this log.
+
+## Round 33 — BUG-041: update test fails `Store::open` with "database is locked" — no busy timeout, and `journal_mode=WAL` itself returns SQLITE_BUSY under a race — 2026-11-15
+
+### BUG-041: FIXED — `Store::open` fails with SQLITE_BUSY when two connections open the same fresh database at once
+
+- Severity: S3 (engine robustness + test-only; the Windows-runner failure)
+- Flow / case: `update_tests::newer_version_available_shows_changelog_and_never_installs`
+  on the GitHub runner (CI run 43729118128, head 63bda459):
+  380 passed, 1 failed
+- Screen: engine tests / store
+  (`app/engine/src/store.rs`, `app/engine/tests/update_tests.rs`)
+- Build: 2026-11-15 (found by CI run 43729118128; the same
+  suite passed on the VPS at the same head, 412/412 —
+  grabber 28/28 and sync 23/23 finally proven on the runner
+  in this run; video_tests never ran, cargo stopped at
+  update_tests)
+
+Steps
+1. On the runner, run `cargo test` in `app/engine`.
+2. Every binary passes except `update_tests`, where exactly
+   one test fails:
+   `newer_version_available_shows_changelog_and_never_installs`
+   panics at `tests\update_tests.rs:95:59` —
+   `called Result::unwrap() on an Err value:
+   Db(SqliteFailure(Error { code: DatabaseBusy, extended_code: 5 },
+   Some("database is locked")))` — on
+   `Store::open(...).unwrap()` in `test_mgr`, not on any
+   changelog assertion.
+
+Expected: the test opens its own fresh database and the
+update check runs.
+Actual: `Store::open` itself fails with SQLITE_BUSY
+("database is locked").
+
+Root cause: two holes, both proven from the code and by a
+reproduction probe (temporary `tests/busy_probe_tests.rs`,
+deleted after verifying the fix).
+- Trigger (test harness): `update_tests.rs::tmpdir()`
+  built `fetchline-test-update-{pid}-{nanos}` with NO
+  disambiguating counter — unlike `common::tmpdir`
+  (BUG-040). The 9 update tests run in parallel in one
+  binary, share the PID, and can call `tmpdir()` in the
+  same clock tick, so two tests open the SAME fresh
+  `app.db` at the same time.
+- Mechanism (engine): `Store::open` ran
+  `execute_batch(SCHEMA_SQL)` — which WRITES (CREATE
+  TABLE + INSERT OR IGNORE) — with NO busy timeout set
+  (SQLite default 0), so the loser of the race failed
+  instantly with SQLITE_BUSY. And the module header
+  claimed "WAL mode" but no journal-mode pragma was ever
+  set, so readers and writers contended in
+  rollback-journal mode.
+- The probe: 8 threads x 100 rounds of concurrent
+  `Store::open` on one fresh path failed 11/800 pre-fix
+  with the exact CI error text ("Database error: database
+  is locked").
+- Subtlety found by the probe: the first fix attempt —
+  an unconditional `PRAGMA journal_mode=WAL` — made it
+  WORSE. A per-step diagnostic (100 rounds x 8, tallying
+  each step) proved `PRAGMA journal_mode=WAL` itself
+  returns SQLITE_BUSY under a race: changing the journal
+  mode needs an exclusive lock and SQLite does NOT consult
+  the busy handler for it. The busy_timeout pragma itself
+  never failed; execute_batch never failed once
+  busy_timeout was set.
+
+Fix:
+- Engine (`src/store.rs::Store::open`):
+  `PRAGMA busy_timeout = 5000` before any statement — a
+  transient lock now waits instead of failing. 5 s is far
+  longer than any schema/migration write, far shorter
+  than a user would notice. `PRAGMA journal_mode=WAL` is
+  now BEST EFFORT: on SQLITE_BUSY it is swallowed (WAL is
+  an optimisation, not a requirement — the database keeps
+  whatever mode it already has and the open still
+  succeeds); any other pragma error still propagates.
+  This also fixes the real production contention: the
+  native host opens the same app.db while the app runs.
+- Test (`tests/update_tests.rs::tmpdir`): a static
+  AtomicUsize counter, same shape as `common::tmpdir` —
+  `fetchline-test-update-{pid}-{n}-{nanos}` — so two
+  tests can never share a directory.
+- Nothing is weakened: no assertion changed, no test
+  deleted or skipped. Probe re-run after the fix: 0/800
+  staggered + 0/800 barrier-synchronised + 0/8
+  single-round. Regression tests kept: the failing test
+  itself (the probe was temporary; its numbers are
+  recorded here).
+Verified: `cargo check --tests` 0 warnings; update_tests
+5x 9/9; full engine suite 413/413 on Linux. VPS
+verification … to follow.
 
 ## Known limitations, not bugs (round-24 additions)
 
