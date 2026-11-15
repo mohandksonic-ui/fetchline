@@ -105,11 +105,21 @@ jobs:
           Write-Host "Installing MSI: $($msi.FullName)"
 
           # 2. Silent install; fail the step if msiexec reports an error.
-          & msiexec.exe /i "$($msi.FullName)" /quiet /norestart /log "$env:GITHUB_WORKSPACE\install.log"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "msiexec failed with exit code $LASTEXITCODE"
-            Get-Content "$env:GITHUB_WORKSPACE\install.log" -Tail 50 -ErrorAction SilentlyContinue
-            throw "MSI install failed (exit code $LASTEXITCODE)"
+          #    Run msiexec via Start-Process -Wait -PassThru. The first
+          #    version used "& msiexec.exe" + $LASTEXITCODE, but on the
+          #    runner $LASTEXITCODE came back BLANK and the step died in 2 s
+          #    before the install even ran (run 43684788098, job
+          #    132723958339) — msiexec is a GUI-subsystem app and "&" does
+          #    not reliably wait for it or set $LASTEXITCODE in
+          #    non-interactive pwsh. -Wait + .ExitCode is the robust form.
+          $msiProc = Start-Process -FilePath 'msiexec.exe' -ArgumentList '/i', "`"$($msi.FullName)`"", '/quiet', '/norestart', '/log', "`"$env:GITHUB_WORKSPACE\install.log`"" -Wait -PassThru
+          $msiCode = $msiProc.ExitCode
+          Write-Host "msiexec exit code: $msiCode"
+          if ($null -eq $msiCode -or $msiCode -ne 0) {
+            Write-Host "===== install.log tail ====="
+            Get-Content "$env:GITHUB_WORKSPACE\install.log" -Tail 100 -ErrorAction SilentlyContinue
+            Write-Host "===== end install.log ====="
+            throw "MSI install failed (exit code $msiCode)"
           }
           Write-Host "MSI installed OK"
 
