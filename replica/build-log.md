@@ -2432,3 +2432,105 @@ went green (run 43686477003).
   compiles (`py_compile`) and Phase 1 dry-runs green locally.
   No product behaviour changed; no licence work; no IDM code,
   assets or wording.
+
+## Installer packaging fix — browser capture for real users (S13) — 2026-11-15
+
+Closes the packaging gap found by the capture-test round above: the MSI
+shipped NO `fetchline-host.exe` and created NO native-messaging registry
+key, so a user install could not capture a single link from a browser
+(the CI capture job only worked because it built + registered the host
+itself, runner-only). Packaging only — no engine change, no licence work.
+
+- Stable extension id first. The repo host manifest carried the
+  placeholder `__FETCHLINE_EXTENSION_ID__` in `allowed_origins`, and
+  `manifest.json` had no `key`, so an unpacked load got a random id on
+  every machine and no shipped manifest could ever name it. Fix: RSA-2048
+  key pair generated in /tmp (private key NOT committed — only the public
+  key goes in `manifest.json`); Chrome derives the stable id from it:
+  `mioamdgogndabpcjbdekggcnlkkfpmbj`. `app/extension/manifest.json` now
+  carries the `key`; `com.fetchline.host.json` names the real id.
+  Firefox is unaffected (uses `browser_specific_settings.gecko.id` =
+  `fetchline@fetchline.app` in `allowed_extensions` already).
+- Validators now pin the identity chain: `validate_manifest.py`
+  requires `key` (base64-decodable, DER SEQUENCE, sane length);
+  `validate_host_manifest.py` treats the placeholder as a FAILURE and
+  cross-checks `allowed_origins[0]` against the id derived from
+  `manifest.json`'s key (SHA-256 -> a-p, implemented in the validator).
+  `npm run test:extension` passes.
+- Ship the host: `tauri.conf.json` gains
+  `bundle.externalBin: ["binaries/fetchline-host"]` (Tauri 2.12
+  semantics verified against the vendored tauri-utils config docs:
+  it looks for `binaries/fetchline-host{-target-triple}{.exe}`).
+  The workflow builds the host (`cargo build --release -p fetchline-host`
+  in app/host) and copies it to
+  `app/src-tauri/binaries/fetchline-host-x86_64-pc-windows-msvc.exe`
+  before `tauri build`; the cargo cache now covers `app/host` too.
+  `*.exe` in .gitignore already covers the staged binary — no
+  .gitignore change needed.
+- Ship the manifests: `bundle.resources` maps both
+  `com.fetchline.host.json` and `com.fetchline.host.firefox.json`
+  into the install dir (next to `fetchline.exe`, for both MSI and
+  NSIS — verified in the vendored tauri-bundler WiX/NSIS templates).
+  Their `path` ships as the default MSI path
+  (`C:\Program Files\Fetchline\fetchline-host.exe`).
+- Registry keys (all HKCU, default value = installed manifest path;
+  removed on uninstall):
+  `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.fetchline.host`,
+  `HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.fetchline.host`,
+  `HKCU\Software\Mozilla\NativeMessagingHosts\com.fetchline.host`
+  (Firefox points at the `.firefox.json` file).
+  - NSIS: `bundle.windows.nsis.installerHooks` ->
+    `app/src-tauri/nsis-hooks/fetchline-native-host.nsh`
+    (POSTINSTALL writes the three keys + runs
+    `register-native-host.ps1` to rewrite both manifests' `path` to
+    `$INSTDIR\fetchline-host.exe`, UTF-8 no BOM; PREUNINSTALL deletes
+    the three keys). NSIS is per-user by default, so the rewrite is
+    required for its default `%LOCALAPPDATA%` install dir.
+  - MSI: `bundle.windows.wix.fragmentPaths` +
+    `componentGroupRefs: ["FetchlineNativeHost"]` ->
+    `app/src-tauri/wix/fetchline-native-host.wxs` (three registry-only
+    components, `Win64="yes"`, `KeyPath="yes"`, values
+    `[INSTALLDIR]com.fetchline.host.json` / `.firefox.json`;
+    Windows Installer removes them on uninstall). The MSI manifest
+    path stays the shipped default — a user picking a custom MSI
+    folder would need to edit the manifest by hand (documented
+    caveat in the fragment + README; no fragment mechanism exists to
+    rewrite file contents).
+  - HKCU caveat (both installers): the keys land in the installing
+    user's hive, so a different Windows user on the same machine
+    needs their own install.
+- Capture test now tests the genuine installed path
+  (`scripts/capture-test.py` Phase 2): it reads the installed
+  registry key + manifest and verifies they point at the installed
+  host with the stable id, requires the discovered extension id to
+  equal the id derived from `manifest.json`'s key, then keeps the
+  popup check + drain + SHA-256. It writes NO manifest and NO key
+  any more. The CI `extension-capture-test` job drops its Rust setup,
+  cargo cache and "Build fetchline-host" steps and passes
+  `--host-exe 'C:\Program Files\Fetchline\fetchline-host.exe'` —
+  it now depends on the MSI from build-windows for the host + key.
+  Phase 1 still dry-runs green locally against the real host binary.
+- Workflow: `continue-on-error: true` removed from the "Engine
+  tests" step (follow-up to BUG-031, fixed in a separate push: the
+  suite did not compile on Windows and stayed hidden precisely
+  because that step swallowed the failure). The step now fails the
+  run visibly. Nothing else about that step changed. Header comments
+  updated to match (engine-tests note + real-download note).
+- Docs: `app/extension/README.md` Windows checklist rewritten
+  (installer now ships host + key; items 1-2 proven by CI, items 4-7
+  still needs-Windows — human right-click, Download All, off
+  switches); the native-host section now says the installer does it
+  all and keeps the manual steps as dev-only; the "No Windows .exe
+  yet" honest-limits bullet updated (installers exist, smoke test
+  green, capture proven on the runner — a human browser pass is
+  still unproven). S13 row note in `replica/features.csv` appended
+  (packaging gap closed).
+- Verified on Linux: full engine suite 413/413 (see final report for
+  the run), `npm run build` passes, `cargo check --tests` 0 warnings,
+  `npm run test:extension` passes, `py_compile` on capture-test.py,
+  `tauri.conf.json` valid JSON, .wxs well-formed XML, NSIS ExecWait
+  expansion simulated (balanced quotes, no unexpanded `$`).
+  The Tauri build itself cannot be verified on this Linux VM
+  (gdk-3.0) — CI is the proof: the next run must show the host
+  staged in the build log, both installers produced, and the
+  capture job green against the installed host + keys.

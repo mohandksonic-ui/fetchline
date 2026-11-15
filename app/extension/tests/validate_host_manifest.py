@@ -15,10 +15,13 @@ and Firefox's (MDN: Native messaging):
   * the Chromium file lists callers in `allowed_origins`, one entry
     per extension, each exactly `chrome-extension://<id>/` — the
     id is 32 lowercase a-p characters and the trailing slash is
-    mandatory; no wildcards are allowed. The repo copy carries the
-    placeholder `__FETCHLINE_EXTENSION_ID__` instead of a real id:
-    that is a WARNING, not a failure — the installer replaces it
-    with the id from chrome://extensions. A wrong id is the most
+    mandatory; no wildcards are allowed. The id is the stable one
+    derived from the public `key` in manifest.json (Chrome hashes
+    the key, so the id is the same on every machine) — the file
+    must name exactly that id, and the installer ships it as-is;
+    the `__FETCHLINE_EXTENSION_ID__` placeholder must never
+    survive (it is a FAILURE now that the id is stable — the
+    installer no longer replaces anything). A wrong id is the most
     common handshake failure (the popup then says the desktop app
     is not reachable).
   * the Firefox file lists callers in `allowed_extensions`, NOT
@@ -31,10 +34,11 @@ and Firefox's (MDN: Native messaging):
 
 Run with `npm run test:extension` from app/, or directly:
     python3 app/extension/tests/validate_host_manifest.py
-Exit code 0 means both manifests are valid (a placeholder id is
-a warning, printed, not a failure); anything else prints the
-problems and exits 1.
+Exit code 0 means both manifests are valid; anything else prints
+the problems and exits 1.
 """
+import base64
+import hashlib
 import json
 import re
 import sys
@@ -46,6 +50,21 @@ HOST_NAME = "com.fetchline.host"
 CHROME_ORIGIN_RE = re.compile(r"^chrome-extension://[a-p]{32}/$")
 PLACEHOLDER_ORIGIN = "chrome-extension://__FETCHLINE_EXTENSION_ID__/"
 WINDOWS_EXE_RE = re.compile(r"^[A-Za-z]:\\.+fetchline-host\.exe$")
+
+
+def chrome_id_from_key(key_b64):
+    """Chrome's extension id: SHA-256 of the DER public key, first
+    16 bytes, each nibble mapped to a-p. Returns None if the key
+    is not usable."""
+    try:
+        der = base64.b64decode(key_b64, validate=True)
+    except (ValueError, base64.binascii.Error):
+        return None
+    digest = hashlib.sha256(der).digest()[:16]
+    return "".join(
+        chr(ord("a") + ((b >> 4) & 0xF)) + chr(ord("a") + (b & 0xF))
+        for b in digest
+    )
 
 
 def load(root, name, problems):
@@ -80,21 +99,42 @@ def check_chromium(root, problems, warnings):
         problems.append(
             "com.fetchline.host.json: allowed_extensions belongs in the Firefox file, not here"
         )
+    # The id must be the stable one derived from the public key in
+    # manifest.json — that is the id Chrome assigns to the
+    # unpacked extension on every machine, and the id the
+    # installer ships. Anything else (including the old
+    # placeholder) can never connect.
+    expected_id = None
+    try:
+        ext = json.loads((root / "manifest.json").read_text())
+        expected_id = chrome_id_from_key(ext.get("key", ""))
+    except (OSError, json.JSONDecodeError) as e:
+        problems.append(f"cannot read manifest.json for the Chrome id: {e}")
+    if expected_id is None:
+        problems.append(
+            "com.fetchline.host.json: cannot derive the expected Chrome id "
+            "from manifest.json's key — fix the key first"
+        )
     origins = manifest.get("allowed_origins")
     if not isinstance(origins, list) or not origins:
         problems.append("com.fetchline.host.json: allowed_origins must be a non-empty list")
         return
     for origin in origins:
         if origin == PLACEHOLDER_ORIGIN:
-            warnings.append(
+            problems.append(
                 "com.fetchline.host.json: allowed_origins still carries the "
-                "__FETCHLINE_EXTENSION_ID__ placeholder — the installer must "
-                "replace it with the id from chrome://extensions"
+                "__FETCHLINE_EXTENSION_ID__ placeholder — the id is stable "
+                "now (manifest.json key), so the file must name the real id"
             )
         elif not CHROME_ORIGIN_RE.match(origin):
             problems.append(
                 f"com.fetchline.host.json: allowed_origins entry {origin!r} is not "
                 "chrome-extension://<32 lowercase a-p chars>/ (trailing slash mandatory, no wildcards)"
+            )
+        elif expected_id is not None and origin != f"chrome-extension://{expected_id}/":
+            problems.append(
+                f"com.fetchline.host.json: allowed_origins entry {origin!r} is not "
+                f"the stable id from manifest.json's key (chrome-extension://{expected_id}/)"
             )
 
 

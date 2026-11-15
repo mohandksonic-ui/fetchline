@@ -13,12 +13,20 @@ URL being handed over, so a login-only link can download (see
 background.js `cookiesFor`); the extension never reads cookies
 for any other URL and never logs them. Firefox needs a stable
 add-on id (`browser_specific_settings.gecko.id`) so its host
-manifest can name it in `allowed_extensions`. Run with
+manifest can name it in `allowed_extensions`. Chrome needs a
+stable extension id too: `key` holds the extension's public key
+(base64 DER), and Chrome derives the same 32-character id from
+it on every machine, so the installer can ship a host manifest
+with that id already in `allowed_origins` (see
+validate_host_manifest.py). Without `key`, an unpacked load
+gets a random id on every machine and no shipped manifest can
+name it. Run with
 `npm run test:extension` from app/, or directly:
     python3 app/extension/tests/validate_manifest.py
 Exit code 0 means the manifest is valid; anything else prints the
 problems and exits 1.
 """
+import base64
 import json
 import sys
 from pathlib import Path
@@ -91,6 +99,29 @@ def main() -> int:
         problems.append(
             "browser_specific_settings.gecko.id must be set (Firefox host manifest names it)"
         )
+
+    # Chrome needs the same stability: `key` is the extension's
+    # public key (base64 DER SubjectPublicKeyInfo). Chrome derives
+    # the extension id from it, so the id is the same on every
+    # machine and the installer can ship a host manifest that
+    # already names it (S13 packaging fix). Without `key`, an
+    # unpacked load gets a random id and no shipped manifest can
+    # name it — the Chrome handshake would never work.
+    key = manifest.get("key", "")
+    if not isinstance(key, str) or not key.strip():
+        problems.append(
+            "key must be set (Chrome derives the stable extension id from it)"
+        )
+    else:
+        try:
+            der = base64.b64decode(key, validate=True)
+        except (ValueError, base64.binascii.Error):
+            problems.append("key must be valid base64")
+            der = b""
+        if der and (len(der) < 100 or der[:2] != b"\x30\x82"):
+            problems.append(
+                "key must be a DER SubjectPublicKeyInfo (SEQUENCE, RSA-2048 is 294 bytes)"
+            )
 
     for name in ("background.js", "popup.html", "popup.js", "popup.css", "video-detect.js", "content.js"):
         if not (root / name).is_file():

@@ -16,12 +16,22 @@ row is read back from SQLite and must be there, source
 ``browser``, status ``pending``.
 
 Phase 2 — real browser transport: load the unpacked extension in
-headless Chrome, discover its extension ID, register the native
-host manifest + registry key exactly as a user install would,
-open ``popup.html`` and poll its status text over CDP until it
-reports "Connected to the Fetchline desktop app". This is the
-step that proves Chrome itself can spawn the host — Phase 1
-alone only proves the host binary, not Chrome's side of it.
+headless Chrome, discover its extension ID, and verify the
+GENUINE installed handshake: the MSI must have written the
+HKCU native-messaging registry key and shipped the host manifest
++ fetchline-host.exe into the install dir. The test reads the
+key and the installed manifest and checks they point at the
+installed host with the extension's stable id — it does NOT
+write its own manifest or key (that was the old runner-only
+workaround for the packaging gap; the installer now provides
+both). Then it opens popup.html and polls its status text over
+CDP until it reports "Connected to the Fetchline desktop app".
+This is the step that proves Chrome itself can spawn the
+installed host — Phase 1 alone only proves the host binary, not
+Chrome's side of it. The extension id is stable because
+manifest.json carries a public `key` (Chrome derives the id
+from it); the test derives the expected id from that key and
+requires the discovered id to match it.
 
 Phase 3 — drain to file: launch the installed desktop app,
 wait for it to drain the queue (startup + 30 s tick) and download
@@ -35,19 +45,20 @@ real popup window. Those paths use the SAME ``sendNativeMessage``
 + ``handToFetchline`` code Phase 2 exercises (the popup's ping
 and the menu's ``download_link`` go through the same transport),
 and the menu/watcher wiring itself is covered by the Node
-fake-``chrome`` tests (``npm run test:extension*``). The MSI
-does NOT ship ``fetchline-host.exe`` and does NOT create the
-registry key (a packaging gap, see build-log.md) — this job
-builds the host and registers it itself, runner-only, as setup.
+fake-``chrome`` tests (``npm run test:extension*``).
 
 Usage (PowerShell, from the repo root):
-  python scripts/capture-test.py --host-exe <fetchline-host.exe>
+  python scripts/capture-test.py --host-exe "C:\\Program Files\\Fetchline\\fetchline-host.exe"
     --db-path <app.db> --extension-dir app/extension
     --chrome-exe "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
     --app-exe "C:\\Program Files\\Fetchline\\fetchline.exe"
     --url <pinned file URL> --expected-sha256 <hex>
     --downloads-dir <Downloads folder>
     [--skip-browser] [--skip-drain]
+
+``--host-exe`` is the INSTALLED host (the MSI ships it next to
+the app binary); Phase 2 verifies the installed registry key +
+manifest point at it instead of registering its own.
 
 ``--skip-browser`` / ``--skip-drain`` exist for local debugging
 only (Phase 1 alone can run on Linux against a built host).
@@ -56,6 +67,7 @@ for Phase 2; Phase 1 and 3 are stdlib-only.
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -226,6 +238,108 @@ def extension_id_from_preferences(profile_dir, extension_dir):
     return None
 
 
+def chrome_id_from_key(key_b64):
+    """Chrome's extension id: SHA-256 of the DER public key, first
+    16 bytes, each nibble mapped to a-p. The id is stable across
+    machines because it is derived from the key in manifest.json."""
+    try:
+        der = base64.b64decode(key_b64, validate=True)
+    except (ValueError, base64.binascii.Error):
+        return None
+    digest = hashlib.sha256(der).digest()[:16]
+    return "".join(
+        chr(ord("a") + ((b >> 4) & 0xF)) + chr(ord("a") + (b & 0xF))
+        for b in digest
+    )
+
+
+def read_registry_default(key_path):
+    """Return the default value of an HKCU key via `reg query`,
+    or None if the key/value is absent. (The MSI/NSIS installer
+    writes these keys; the test only reads them.)"""
+    try:
+        out = subprocess.run(
+            ["reg", "query", key_path, "/ve"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        fail("browser", f"reg query failed for {key_path}: {e}")
+    if out.returncode != 0:
+        return None
+    for line in out.stdout.splitlines():
+        if "(Default)" in line and "REG_SZ" in line:
+            return line.split("REG_SZ", 1)[1].strip()
+    return None
+
+
+def verify_installed_handshake(extension_dir, host_exe):
+    """Verify what the installer must have provided: the HKCU
+    native-messaging key pointing at the installed Chrome manifest,
+    the manifest pointing at the installed host exe, and the
+    manifest naming the extension's stable id. Returns the expected
+    extension id. Any mismatch fails — this is the genuine
+    installed path, not a test-only registration."""
+    manifest_path = os.path.join(extension_dir, "manifest.json")
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            ext_manifest = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        fail("browser", f"cannot read {manifest_path}: {e}")
+    expected_id = chrome_id_from_key(ext_manifest.get("key", ""))
+    if not expected_id:
+        fail(
+            "browser",
+            "extension manifest.json has no usable key — no stable id "
+            "to expect (the id is derived from the key)",
+        )
+    log(f"  expected extension id (from manifest.json key): {expected_id}")
+
+    key_path = (
+        r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.fetchline.host"
+    )
+    installed_manifest = read_registry_default(key_path)
+    if not installed_manifest:
+        fail(
+            "browser",
+            "registry key HKCU\\Software\\Google\\Chrome\\"
+            "NativeMessagingHosts\\com.fetchline.host is missing — the "
+            "installer did not register the native host",
+        )
+    log(f"  registry key -> {installed_manifest}")
+    if not os.path.isfile(installed_manifest):
+        fail(
+            "browser",
+            f"registry key points at {installed_manifest}, which does "
+            "not exist — the installer did not ship the host manifest",
+        )
+    try:
+        with open(installed_manifest, encoding="utf-8") as f:
+            host_manifest = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        fail("browser", f"cannot read installed manifest {installed_manifest}: {e}")
+    manifest_host = host_manifest.get("path", "")
+    if os.path.normcase(os.path.abspath(manifest_host)) != os.path.normcase(
+        os.path.abspath(host_exe)
+    ):
+        fail(
+            "browser",
+            f"installed manifest path is {manifest_host!r}, expected the "
+            f"installed host {host_exe!r} — the installer shipped a "
+            "manifest pointing at the wrong host",
+        )
+    origins = host_manifest.get("allowed_origins", [])
+    expected_origin = f"chrome-extension://{expected_id}/"
+    if origins != [expected_origin]:
+        fail(
+            "browser",
+            f"installed manifest allowed_origins is {origins!r}, expected "
+            f"[{expected_origin!r}] — the installer shipped a manifest "
+            "naming the wrong extension id",
+        )
+    log("  installed manifest: path + allowed_origins OK")
+    return expected_id
+
+
 def phase_browser(chrome_exe, extension_dir, host_exe):
     log("PHASE 2: real browser — headless Chrome + extension + native host")
     try:
@@ -237,8 +351,12 @@ def phase_browser(chrome_exe, extension_dir, host_exe):
     extension_dir = os.path.abspath(extension_dir)
     if not os.path.isfile(os.path.join(extension_dir, "manifest.json")):
         fail("browser", f"no manifest.json in {extension_dir}")
+    # The installer provides the host + registry key; verify them
+    # before launching Chrome — a missing key here is an installer
+    # bug, and the popup check below would only repeat the same
+    # failure more slowly.
+    expected_id = verify_installed_handshake(extension_dir, host_exe)
     profile_dir = tempfile.mkdtemp(prefix="fl-chrome-profile-")
-    tmp_dir = tempfile.mkdtemp(prefix="fl-host-manifest-")
     chrome = subprocess.Popen(
         [
             chrome_exe,
@@ -273,30 +391,14 @@ def phase_browser(chrome_exe, extension_dir, host_exe):
         if not ext_id:
             fail("browser", "could not discover the extension ID (no chrome-extension:// target and no Preferences entry)")
         log(f"  extension ID: {ext_id}")
-
-        # Register the native host exactly as a user install would:
-        # manifest JSON + HKCU registry key pointing at it.
-        manifest_path = os.path.join(tmp_dir, "com.fetchline.host.json")
-        manifest = {
-            "name": "com.fetchline.host",
-            "description": "Fetchline native messaging host",
-            "path": os.path.abspath(host_exe),
-            "type": "stdio",
-            "allowed_origins": [f"chrome-extension://{ext_id}/"],
-        }
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
-        reg = subprocess.run(
-            [
-                "reg", "add",
-                r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.fetchline.host",
-                "/ve", "/t", "REG_SZ", "/d", manifest_path, "/f",
-            ],
-            capture_output=True, text=True,
-        )
-        if reg.returncode != 0:
-            fail("browser", f"reg add failed ({reg.returncode}): {reg.stdout} {reg.stderr}")
-        log(f"  host manifest + registry key written: {manifest_path}")
+        if ext_id != expected_id:
+            fail(
+                "browser",
+                f"discovered extension id {ext_id} is not the stable id "
+                f"{expected_id} derived from manifest.json's key — the "
+                "extension was not loaded with its shipped key",
+            )
+        log("  discovered id matches the stable id from manifest.json's key")
 
         # Open popup.html as a tab and poll its status text over CDP.
         popup_url = f"chrome-extension://{ext_id}/popup.html"
@@ -374,7 +476,6 @@ def phase_browser(chrome_exe, extension_dir, host_exe):
             except Exception:  # noqa: BLE001
                 pass
         shutil.rmtree(profile_dir, ignore_errors=True)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- Phase 3
