@@ -114,7 +114,7 @@ fn build_manager(app: &AppHandle) -> Result<Arc<DownloadManager>, String> {
     // 8 connections is the schema default; the stored settings are
     // applied in `setup` (apply_settings), which also wires the
     // saved proxy, speed limit and retry count.
-    Ok(DownloadManager::new(store, 8))
+    Ok(DownloadManager::new(Arc::new(store), 8))
 }
 
 #[tauri::command]
@@ -779,7 +779,7 @@ pub fn run() {
                 Ok(m) => m,
                 Err(e) => {
                     log_startup(log, &format!("build_manager failed: {e}"));
-                    return Err(e);
+                    return Err(e.into());
                 }
             };
             log_startup(log, "manager built");

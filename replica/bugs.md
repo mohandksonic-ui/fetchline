@@ -2251,3 +2251,86 @@ File: `app/src-tauri/src/lib.rs` (diagnostics only).
 - The diagnostics code lives in the Tauri shell, which never
   compiles on this VM; its only proof is the CI run after the
   push.
+
+## Round 23 — Diagnostics build fails CI run #6 (two E0308 type errors) — 2026-11-15
+
+### BUG-030: Diagnostics rewrite broke the Windows build with two E0308 type errors in `app/src-tauri/src/lib.rs`
+
+- Severity: S2
+- Flow / case: CI build (GitHub Actions, windows-latest), step 9
+  "Build Windows installer (MSI + NSIS)"
+- Screen: S01 (shell: `app/src-tauri/src/lib.rs`)
+- Build: 2026-11-15 (CI run #6, 43680534913, commit f51e6199 —
+  the BUG-029 diagnostics round)
+
+Steps
+1. Push the BUG-029 diagnostics commit (f51e6199).
+2. CI run #6: steps 1–8 success (including step 8 engine tests);
+   step 9 fails; step 10 skipped; no artifact.
+
+Expected: the diagnostics build compiles and produces the
+instrumented installer.
+Actual: step 9 fails with two Rust E0308 errors, both in the
+diagnostics rewrite of `lib.rs` (frontend Vite build succeeded
+first, "✓ built in 3.09s"):
+1. lib.rs:117 — `Ok(DownloadManager::new(store, 8))`: expected
+   `Arc<Store>`, found `Store`. `DownloadManager::new` is
+   `pub fn new(store: Arc<Store>, max_connections: usize) ->
+   Arc<Self>` (engine/src/manager.rs:335); the pre-diagnostics
+   code wrapped the store in `Arc::new(...)` and the rewrite
+   dropped it.
+2. lib.rs:782 — inside the `.setup(|app| { ... })` closure,
+   `return Err(e);`: expected `Box<dyn Error>`, found `String`.
+   `build_manager` returns `Result<Arc<DownloadManager>,
+   String>`; the setup closure returns `Result<(), Box<dyn
+   Error>>`. The old code propagated with `?` (auto-converts
+   String into Box<dyn Error>); the explicit `return Err(e)`
+   does not convert.
+Evidence: step-9 log tail read from the user's signed-in
+browser (lines 25-75), two E0308 errors only — no other
+compile error in the crate, so every other diagnostics symbol
+(`tauri::webview_version()`, panic hook, log helpers, `run()`
+match) resolved and type-checked.
+Suspected cause: rewrite dropped the `Arc::new` wrapper and
+replaced `?` with an explicit `return Err` without the
+conversion.
+Status: FIXED. Fix (two lines, `app/src-tauri/src/lib.rs`
+only, no redesign): line 117 now
+`Ok(DownloadManager::new(Arc::new(store), 8))` (`Arc` was
+already imported); line 782 now `return Err(e.into());` —
+the same `From<String> for Box<dyn Error>` conversion the
+old `?` used, with the `log_startup(... "build_manager
+failed: {e}")` line kept above it. Whole-file re-audit of the
+diagnostics diff (milestones, panic hook, `webview_version`,
+both log-path helpers, `log_startup`, `run()` match,
+`get_settings` once-marker): no other Windows-only compile
+risk found — the only other `return Err` sites in the file
+already return `e.to_string()` into `Result<..., String>`,
+and `Store::open` returns a plain `Store` (so `Arc::new` is
+the right wrapper). BUG-029 stays OPEN — this round only
+repairs the diagnostics build; its root cause is still
+unknown until the user runs the instrumented build and sends
+`startup.log`.
+Regression test kept: none added — the failure is a
+compile-time type error in the Tauri shell, which never
+compiles on this VM; the CI run after the push is the proof.
+The two signatures were re-verified by reading the code
+(`manager.rs:335`, `store.rs:324`).
+Verified: full suite 411/411 pass, 0 failed; `cargo check
+--tests` 0 warnings; `npm run build` passes (✓ built in
+3.88s); parity unchanged 85.4/100 (must-haves 17/17).
+Windows cross-check still blocked on this VM (no MinGW gcc;
+Tauri lib uncheckable here) — the CI run after the push is
+the proof.
+File: `app/src-tauri/src/lib.rs` (2 lines) + this log +
+`replica/build-log.md`.
+
+## Known limitations, not bugs (round-23 additions)
+
+- The Tauri shell never compiles on this VM, so type errors
+  like BUG-030 can only be caught by the CI run after the
+  push — the Linux-side checks (engine suite, npm build)
+  cannot see them. Both BUG-027/028/030 were the same class
+  of failure: shell code that only Windows proves.
+- BUG-029 is still open by design until the instrumented
+  build is installed and its `startup.log` is read.

@@ -2277,3 +2277,21 @@ check and download quota untouched, as instructed.
   the CI run after the push is the proof. Next step is the user
   installing this build, launching once, and sending the
   `startup.log`. Licence (S11) untouched.
+
+## BUG-030 — Diagnostics rewrite broke the Windows build (two E0308 type errors) — 2026-11-15
+- CI run #6 (43680534913, commit f51e6199) failed at step 9 with
+  two E0308 errors in `app/src-tauri/src/lib.rs`, both from the
+  BUG-029 diagnostics rewrite: (1) `DownloadManager::new(store,
+  8)` passed a plain `Store` where `Arc<Store>` is required;
+  (2) `return Err(e)` in the setup closure passed a `String`
+  where `Box<dyn Error>` is required (the old `?` converted it
+  automatically). No other compile error in the crate.
+- Fix: two lines only — `Ok(DownloadManager::new(Arc::new(store),
+  8))` and `return Err(e.into());` (same conversion the old `?`
+  used), log line kept. Whole diagnostics diff re-audited for
+  other Windows-only compile risks; none found.
+- Verified: full suite 411/411 pass, `cargo check --tests` 0
+  warnings, `npm run build` passes, parity unchanged 85.4/100
+  (must-haves 17/17). Tauri lib still uncheckable on this VM —
+  the CI run after the push is the proof. BUG-029 stays OPEN.
+  Licence (S11) untouched.
