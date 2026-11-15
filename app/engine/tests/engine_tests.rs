@@ -537,7 +537,13 @@ async fn queue_action_run_program_executes_and_dismiss_clears() {
     assert!(mgr.pending_action(&quiet.id).await.is_none());
 }
 
+/// The shutdown action refuses off Windows — and it must never
+/// run on Windows in a test: there the action really executes
+/// `shutdown /s /t 0` and powers the machine off (BUG-033: an
+/// ungated run of this test stopped the AWS VPS mid-suite).
+/// Linux-only by nature; Windows has no equivalent assertion.
 #[tokio::test]
+#[cfg(not(target_os = "windows"))]
 async fn queue_action_shutdown_errors_off_windows() {
     let server = MockServer::start(MockConfig { chunk: 65536, delay: Duration::ZERO, hide_length: false, ..Default::default() });
     let dir = tmpdir();

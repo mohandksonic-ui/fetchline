@@ -2580,6 +2580,80 @@ CI run after the push (Engine tests step now fails
 visibly without `continue-on-error`).
 File: `app/engine/src/secret.rs` + this log.
 
+## Round 27 — BUG-033: shutdown test powers the machine off on Windows (and two more ungated tests) — 2026-11-15
+
+### BUG-033: FIXED — `queue_action_shutdown_errors_off_windows` executes a real shutdown on Windows
+
+- Severity: S1 (destructive on the machine it runs on)
+- Flow / case: `cargo test` (full suite) on Windows
+- Screen: engine tests (`app/engine/tests/engine_tests.rs:541`)
+- Build: 2026-11-15 (found by the CI monitor: its
+  `--no-fail-fast` run on the AWS VPS stopped the instance
+  mid-suite; `describe-instances` reports the instance
+  **stopped**, StateReason `Client.InstanceInitiatedShutdown`
+  — a shutdown issued from inside Windows)
+
+Steps
+1. On Windows, run `cargo test` in `app/engine` with
+   `--no-fail-fast` (or let the suite reach this test).
+2. The test arms a `shutdown` completion action and calls
+   `execute_queue_action`, expecting the Linux error
+   "only available on Windows".
+3. On Windows the action really runs `shutdown /s /t 0`
+   (`app/engine/src/queue.rs`, Windows branch) — an
+   immediate, undelayed shutdown of the machine. The
+   GitHub runner is ephemeral so it just fails the step;
+   the VPS stopped outright (public IP gone, SSM dead
+   until the instance is started again).
+
+Expected: the test passes on every platform.
+Actual: on Windows it powers the machine off — the suite
+can never go green there, and any machine running the
+suite (VPS, runner, developer PC) shuts down.
+
+Root cause: the same missing-gate pattern as BUG-031 /
+BUG-032 — the test's name says "off_windows" but it has
+no `#[cfg]` gate, and its assertion only holds where the
+action refuses. The `shutdown` / `hibernate` actions are
+Windows-only by design (`shutdown /s /t 0`, `shutdown /h`);
+no test may execute them.
+
+Fix (test-only, no engine change): the test is gated
+`#[cfg(not(target_os = "windows"))]` with a comment
+stating why it can never run on Windows. The same audit
+found and fixed two more tests with the same flaw, which
+would have failed the next CI run (harmless, no
+shutdown): the dial-up hang-up test
+(`options_tests.rs`, `dialup_hangup_arms_action_only_when_queue_has_no_action`)
+expected the "only available on Windows" error, but on
+Windows the action spawns `rasdial <name> /disconnect`
+and reports Ok — now Ok on Windows, error elsewhere;
+and the sound test
+(`sound_disabled_event_records_nothing_and_playback_is_windows_only`)
+expected playback to error "only available on Windows",
+but on Windows the file really plays (PowerShell
+SoundPlayer, spawn returns Ok) — now Ok on Windows,
+error elsewhere. The audit also verified the other
+`execute_queue_action` call sites are safe on Windows:
+`run_program` (marker script), `open_file` (`cmd /C
+start`), `none` (no pending action → error), and the
+grabber shutdown case (dismissed before execute, so the
+action never runs); `hibernate` is never executed by any
+test.
+Regression tests kept: all three fixed tests (they now
+run correctly on both platforms, or only where safe).
+Verified: on Linux the three tests pass 1/1 each (the
+shutdown test still runs here — the gate preserves Linux
+behaviour); `cargo check --tests` 0 warnings. Windows
+proof is the CI run after the push — the engine-tests
+step must now pass end to end, which also proves the
+BUG-031 `.bat` fixtures and the BUG-032 fix. The VPS was
+left **stopped** (the shutdown stopped it, which also
+stops the hourly billing); restart with `aws ec2
+start-instances` if SSM access is needed again.
+File: `app/engine/tests/engine_tests.rs`,
+`app/engine/tests/options_tests.rs` + this log.
+
 ## Known limitations, not bugs (round-24 additions)
 
 - The Tauri shell never compiles or runs on this VM, so a

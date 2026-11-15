@@ -419,12 +419,21 @@ async fn dialup_hangup_arms_action_only_when_queue_has_no_action() {
     assert_eq!(action.action, "hangup");
     assert_eq!(action.program.as_deref(), Some("My Connection"));
     // Off Windows the hang-up cannot run: it errors, honestly,
-    // instead of pretending to disconnect anything.
-    let err = mgr.execute_queue_action(&queue.id).await.unwrap_err();
-    assert!(
-        err.to_string().contains("only available on Windows"),
-        "got: {err}"
-    );
+    // instead of pretending to disconnect anything. On Windows
+    // it spawns `rasdial <name> /disconnect` (which does nothing
+    // for a connection that does not exist) and reports Ok.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let err = mgr.execute_queue_action(&queue.id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("only available on Windows"),
+            "got: {err}"
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        mgr.execute_queue_action(&queue.id).await.unwrap();
+    }
     assert!(mgr.pending_action(&queue.id).await.is_none(), "the action is consumed");
 }
 
@@ -645,10 +654,21 @@ async fn sound_disabled_event_records_nothing_and_playback_is_windows_only() {
     assert!(mgr.test_sound_file("/tmp/fetchline-test-no-such-file.wav").is_err());
     // A real WAV file exists, so validation passes — and on this
     // Linux VM the honest answer is that playback is Windows-only.
+    // On Windows the file really plays (PowerShell SoundPlayer),
+    // so the same calls report Ok there instead of erroring.
     let wav = wav_file(&dir, "test.wav");
-    let err = mgr.test_sound_file(&wav).unwrap_err();
-    assert!(err.to_string().contains("only available on Windows"), "got: {err}");
-    set_sound(&mgr, "download_complete", &wav);
-    let err = mgr.play_sound("download_complete").unwrap_err();
-    assert!(err.to_string().contains("only available on Windows"), "got: {err}");
+    #[cfg(not(target_os = "windows"))]
+    {
+        let err = mgr.test_sound_file(&wav).unwrap_err();
+        assert!(err.to_string().contains("only available on Windows"), "got: {err}");
+        set_sound(&mgr, "download_complete", &wav);
+        let err = mgr.play_sound("download_complete").unwrap_err();
+        assert!(err.to_string().contains("only available on Windows"), "got: {err}");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        assert!(mgr.test_sound_file(&wav).is_ok());
+        set_sound(&mgr, "download_complete", &wav);
+        assert!(mgr.play_sound("download_complete").is_ok());
+    }
 }
