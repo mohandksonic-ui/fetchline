@@ -1,0 +1,1 @@
+Write access test from Muse - if this file exists, the GitHub connector can write.
