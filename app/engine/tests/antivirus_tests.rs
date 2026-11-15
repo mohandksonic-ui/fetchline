@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,11 +42,63 @@ fn set_scanner(mgr: &DownloadManager, command: Option<&str>, enabled: bool, time
 
 /// Write a fake scanner script into `dir` and make it executable.
 /// `body` is the script body after the shebang line.
+/// On Windows the same body is translated to a .bat file (the
+/// engine runs the scanner command directly, and CreateProcess
+/// handles .bat files); the bodies used here are a closed set
+/// (`exit N`, `sleep N`, `echo ...`, and the `printf ... >> <record>`
+/// recorder), and any other line fails loudly instead of silently
+/// passing. The returned path is the script to put in the command
+/// template — `.sh` on Unix, `.bat` on Windows.
 fn fake_scanner(dir: &Path, name: &str, body: &str) -> PathBuf {
+    #[cfg(windows)]
+    let path = dir.join(format!(
+        "{}.bat",
+        name.strip_suffix(".sh").unwrap_or(name)
+    ));
+    #[cfg(not(windows))]
     let path = dir.join(name);
+    #[cfg(windows)]
+    std::fs::write(&path, format!("@echo off\n{}\n", translate_body_to_batch(body))).unwrap();
+    #[cfg(not(windows))]
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
+}
+
+/// Translate a fake-scanner shell body to batch, line by line.
+/// Only the constructs the tests actually use are supported.
+#[cfg(windows)]
+fn translate_body_to_batch(body: &str) -> String {
+    let mut out = String::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(record) = line.strip_prefix("printf '%s\\n' \"$1\" >> ") {
+            // Recorder: write the scanned path (%1) into the record file.
+            out.push_str(&format!("@echo %1>> \"{}\"\n", record.trim()));
+        } else if let Some(secs) = line.strip_prefix("sleep ") {
+            // `timeout` refuses redirected stdin (the engine runs
+            // the scanner with stdin nulled); ping is the classic
+            // batch sleep and works with stdin redirected.
+            let n: u64 = secs.trim().parse().expect("sleep N must be a number");
+            out.push_str(&format!("ping -n {} 127.0.0.1 >nul\n", n + 1));
+        } else if let Some(code) = line.strip_prefix("exit ") {
+            out.push_str(&format!("exit /b {}\n", code.trim()));
+        } else if let Some(rest) = line.strip_prefix("echo ") {
+            let rest = rest.replace("$1", "%1");
+            let rest = rest
+                .strip_prefix('"')
+                .and_then(|r| r.strip_suffix('"'))
+                .unwrap_or(&rest);
+            out.push_str(&format!("echo {rest}\n"));
+        } else {
+            panic!("fake_scanner: no Windows translation for shell line: {line}");
+        }
+    }
+    out
 }
 
 async fn complete_download(

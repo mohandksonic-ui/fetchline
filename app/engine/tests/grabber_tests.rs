@@ -432,10 +432,19 @@ fn create_full(
 
 /// A shell script that proves it ran by writing a marker file
 /// (same pattern as the queue run-program test in engine_tests.rs).
+/// Windows runs a .bat directly (CreateProcess handles it); Unix
+/// runs a .sh with +x.
 fn marker_script(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let marker = dir.join(format!("{name}.ran.txt"));
+    #[cfg(windows)]
+    let script = dir.join(format!("{name}.bat"));
+    #[cfg(not(windows))]
     let script = dir.join(format!("{name}.sh"));
+    #[cfg(windows)]
+    std::fs::write(&script, format!("@echo done > \"{}\"\n", marker.display())).unwrap();
+    #[cfg(not(windows))]
     std::fs::write(&script, format!("#!/bin/sh\necho done > {}\n", marker.display())).unwrap();
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();

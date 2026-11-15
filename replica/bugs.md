@@ -2451,6 +2451,87 @@ the push is the proof.
 File: `app/src-tauri/src/lib.rs` (6 lines) + this log +
 `replica/build-log.md`.
 
+## Round 25 — BUG-031: engine test suite does not compile on Windows (Unix-only test fixtures) — 2026-11-15
+
+### BUG-031: FIXED — `std::os::unix` in test fixtures breaks the Windows test build
+
+- Severity: S2
+- Flow / case: `cargo test` (full suite) on Windows
+- Screen: engine tests (`app/engine/tests/`)
+- Build: 2026-11-15 (found by the VPS test: `cargo test` on
+  Windows Server 2025, repo head 7537cc9)
+
+Steps
+1. On Windows, run `cargo test` in `app/engine`.
+2. The `engine_tests` target fails to compile:
+   `error[E0433]: cannot find 'unix' in 'os'` at
+   `tests/engine_tests.rs:490` (`use std::os::unix::fs::PermissionsExt;`)
+   and `error[E0599]: no associated function or constant named
+   'from_mode'` at line 491
+   (`Permissions::from_mode(0o755)`). No test target runs at
+   all in that invocation.
+
+Expected: the full engine suite compiles and runs on Windows.
+Actual: the suite never compiles on Windows. It was invisible
+in CI because the workflow's "Engine tests" step has
+`continue-on-error: true` — the step's failure never failed
+the run, and the separate real-download step (Windows-clean)
+passed, hiding it.
+
+Root cause: three test fixtures used Unix-only APIs with no
+platform gate — the run-program marker scripts in
+`engine_tests.rs` (`queue_action_run_program_executes_and_dismiss_clears`)
+and `grabber_tests.rs` (`marker_script`, used by
+`grabber_completion_action_runs_when_files_downloaded`), and
+the fake antivirus scanner in `antivirus_tests.rs`
+(`fake_scanner`, used by all 17 antivirus tests). All three
+wrote a `.sh` script and set +x with
+`PermissionsExt::from_mode(0o755)`.
+
+Fix: make each fixture platform-aware, test-only, no engine
+change.
+- `engine_tests.rs` / `grabber_tests.rs`: the marker script
+  is now `on_done.bat` / `{name}.bat` on Windows
+  (`@echo done > "<marker>"`, run directly by
+  `Command::new` — CreateProcess handles .bat files) and
+  the `.sh` + `#[cfg(unix)]` chmod on Unix. The Unix script
+  is byte-identical to before.
+- `antivirus_tests.rs`: `fake_scanner` writes a `.bat` on
+  Windows (`.sh` name rewritten to `.bat`, `@echo off`
+  header) by translating the body line by line
+  (`translate_body_to_batch`, Windows-only): `exit N` →
+  `exit /b N`; `sleep N` → `ping -n N+1 127.0.0.1 >nul`
+  (`timeout` refuses redirected stdin — the engine runs the
+  scanner with stdin nulled — while ping works);
+  `echo ...` → same text with `$1` → `%1` and outer quotes
+  dropped; the `printf '%s\n' "$1" >> <record>` recorder →
+  `@echo %1>> "<record>"`. Any other shell line panics with
+  a clear message instead of silently passing. The Unix
+  path is unchanged (`#!/bin/sh` + `#[cfg(unix)]` chmod).
+Regression tests kept: the three existing tests that use
+these fixtures (they now run on both platforms instead of
+only Unix).
+Verified: `cargo check --tests` 0 warnings on Linux;
+`cargo test --test engine_tests
+queue_action_run_program_executes_and_dismiss_clears` 1/1
+pass; `cargo test --test grabber_tests
+grabber_completion_action_runs_when_files_downloaded` 1/1
+pass; `cargo test --test antivirus_tests` 17/17 pass. The
+batch translator was checked standalone against all six
+body shapes used by the tests (exit, echo, sleep, threat
+echo, found echo, printf recorder) — all six translate
+exactly. Full Windows proof is the CI run after the push:
+the `continue-on-error` on the "Engine tests" step must
+also be removed (separate workflow change, with the
+packaging fix) so a Windows compile break can never hide
+again. A direct `cargo check --tests --target
+x86_64-pc-windows-msvc` on this VM is blocked by the
+`rusqlite` bundled build needing MSVC `lib.exe` (cc-rs
+error, unrelated to this fix).
+File: `app/engine/tests/engine_tests.rs`,
+`app/engine/tests/grabber_tests.rs`,
+`app/engine/tests/antivirus_tests.rs` + this log.
+
 ## Known limitations, not bugs (round-24 additions)
 
 - The Tauri shell never compiles or runs on this VM, so a

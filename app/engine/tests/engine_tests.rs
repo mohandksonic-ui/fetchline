@@ -483,9 +483,18 @@ async fn queue_action_run_program_executes_and_dismiss_clears() {
     let store = Arc::new(Store::open(&dir.join("app.db")).unwrap());
     let mgr = DownloadManager::new(Arc::clone(&store), 4);
     // A script that proves it ran by writing a marker file.
+    // Windows runs .bat files directly (CreateProcess handles
+    // them); Unix runs a .sh with +x.
     let marker = dir.join("ran.txt");
+    #[cfg(windows)]
+    let script = dir.join("on_done.bat");
+    #[cfg(not(windows))]
     let script = dir.join("on_done.sh");
+    #[cfg(windows)]
+    std::fs::write(&script, format!("@echo done > \"{}\"\n", marker.display())).unwrap();
+    #[cfg(not(windows))]
     std::fs::write(&script, format!("#!/bin/sh\necho done > {}\n", marker.display())).unwrap();
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
