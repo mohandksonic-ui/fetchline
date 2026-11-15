@@ -2197,15 +2197,49 @@ window config normal (1100x700, title Fetchline),
 `DownloadManager::new` only panics if the reqwest fallback
 client fails to build. The user sent a screen recording of the
 launch (blank white window, then close).
-Suspected cause: STILL UNKNOWN. Two candidates remain: (a) a
-main-thread panic that exits cleanly with code 101 — invisible
-with `windows_subsystem = "windows"` and no WER entry; (b) the
-WebView2 renderer failing and taking the window down. Several
-rounds of guessing produced no answer, so this round instruments
-the app instead of guessing again.
-Status: OPEN — diagnostics added, root cause unknown until the
-user runs the instrumented build and sends its log. Fix
-(diagnostics only, no behaviour change): `app/src-tauri/src/lib.rs`
+Root cause: PROVEN by the user's `startup.log` (run #7
+instrumented build, launched 07:47:21 EET, 2026-11-15) — the
+log's last line is `PANIC at src\lib.rs:793:13: there is no
+reactor running, must be called from the context of a Tokio
+1.x runtime`. The `.setup` closure calls `tokio::spawn` six
+times (lines 793/802/813/824/834/839) but setup runs
+synchronously on the main thread OUTSIDE any Tokio runtime
+context, so the very first `tokio::spawn` panics; the panic
+unwinds out of setup and the process exits cleanly with code
+101 — hence no WER / Application Error entry and the blank
+flash (the webview never loads because the event loop never
+starts). WebView2 is FINE: the log's second line is
+`webview version: 157.0.4341.46` (recent) — the WebView2
+theory is dead. The bug was latent since the first build:
+the Tauri shell never ran anywhere before the user's PC, so
+it was never caught; it is NOT a Windows-only quirk — it
+would panic on any platform. Full log: `main entered`,
+`webview version: 157.0.4341.46`, `setup start`,
+`db_path ok: C:\Users\adham\AppData\Roaming\com.fetchline.app\fetchline\app.db`,
+`store opened`, `manager built`, `settings applied`,
+`PANIC at src\lib.rs:793:13: ...` — the log never reaches
+"spawns done" or "setup ok".
+Status: FIXED (Round 24). Fix: all six `tokio::spawn` calls
+in the setup closure replaced with `tauri::async_runtime::spawn`
+— Tauri's own runtime handle, the correct way to spawn
+background tasks from setup (verified against vendored tauri
+2.12.5: `pub fn spawn<F>(task: F) -> JoinHandle<F::Output>`
+where `F: Future + Send + 'static`, `F::Output: Send +
+'static`, `async_runtime.rs:300`). Each spawned body is
+EXACTLY as before (same futures, same logic, no behaviour
+change); the `tokio::time::interval` inside the tick task
+stays as-is — it now runs inside a task on the runtime, so
+it has reactor context. Audit of the rest of `lib.rs` and
+`main.rs`: no other `tokio::spawn` / `tokio::task::spawn`
+outside a runtime context — the only other `tokio` use in
+the shell is that `interval` call. `tokio::spawn` inside
+`async fn` Tauri commands is fine (commands run on Tauri's
+async runtime) and was left alone. The startup.log
+diagnostics stay in place (they proved their worth); after
+the fix the log should reach "spawns done" and "setup ok",
+plus "frontend reached backend: get_settings ok" once the
+frontend mounts.
+Fix (diagnostics only, no behaviour change): `app/src-tauri/src/lib.rs`
 now writes an append-only `startup.log` next to the database
 (`%APPDATA%\com.fetchline.app\fetchline\startup.log`) with
 milestones — "main entered", "webview version: {v or ERROR}",
@@ -2241,10 +2275,12 @@ File: `app/src-tauri/src/lib.rs` (diagnostics only).
 
 ## Known limitations, not bugs (round-22 additions)
 
-- The root cause of the launch failure is still unknown; this
-  round only instruments it. The diagnosis depends on the
-  `startup.log` from the user's next launch of the instrumented
-  build.
+- (Resolved in Round 24 — see below.) The root cause of the
+  launch failure was unknown when this round ran; it only
+  instrumented the app. The `startup.log` from the user's
+  next launch of the instrumented build proved the cause:
+  `tokio::spawn` in the setup closure panics with no reactor
+  running (BUG-029, fixed in Round 24).
 - The user refuses command-line / PowerShell steps, so all
   further diagnosis must come from the app itself or from plain
   GUI steps (install, launch, send a file).
@@ -2334,3 +2370,97 @@ File: `app/src-tauri/src/lib.rs` (2 lines) + this log +
   of failure: shell code that only Windows proves.
 - BUG-029 is still open by design until the instrumented
   build is installed and its `startup.log` is read.
+
+## Round 24 — BUG-029 root cause found in startup.log; fix: spawn on the Tauri async runtime — 2026-11-15
+
+### BUG-029: RESOLVED — `tokio::spawn` in the setup closure panics: "there is no reactor running"
+
+- Severity: S1
+- Flow / case: app launch, first run on real Windows
+- Screen: S01 (shell: `app/src-tauri/src/lib.rs`)
+- Build: 2026-11-15 (CI run #7, 43682153394, commit bbd03779 —
+  the instrumented diagnostics build)
+
+Steps
+1. Install the MSI from the run-#7 artifact
+   (`fetchline-windows-installer`) on the user's real Windows
+   PC, launch once, and send
+   `%APPDATA%\com.fetchline.app\fetchline\startup.log`.
+2. The log (epoch 1794721641, 07:47:21 EET) reads:
+   `main entered`, `webview version: 157.0.4341.46`,
+   `setup start`, `db_path ok: ...\app.db`, `store opened`,
+   `manager built`, `settings applied`, then
+   `PANIC at src\lib.rs:793:13: there is no reactor
+   running, must be called from the context of a Tokio 1.x
+   runtime`. It never reaches "spawns done" or "setup ok".
+
+Expected: the Fetchline window opens and stays open.
+Actual: blank white window for ~1-2 s, then the process
+exits; no error dialog, no WER / Application Error entry.
+Evidence: the startup.log above — the panic is at the very
+first `tokio::spawn` in the setup closure (lib.rs:793). The
+log also kills the WebView2 theory: version 157.0.4341.46
+is recent and loaded fine.
+Root cause: the `.setup` closure runs synchronously on the
+main thread, outside any Tokio runtime context, but it calls
+`tokio::spawn` six times (lines 793/802/813/824/834/839 —
+progress, action and update forwarders, 30 s scheduler tick,
+startup drain, startup queues). `tokio::spawn` requires a
+reactor in the current context, so the first call panics;
+the panic unwinds out of setup and the process exits
+cleanly with code 101, before the event loop (and the
+webview) ever starts. Latent since the first build — the
+Tauri shell never ran anywhere before the user's PC. Not a
+Windows-only quirk: it would panic on any platform.
+Status: FIXED. Fix (six lines, `app/src-tauri/src/lib.rs`
+only, spawn-site change only, no behaviour change): every
+`tokio::spawn` in the setup closure is now
+`tauri::async_runtime::spawn` — Tauri's own runtime handle,
+the correct way to spawn background tasks from setup
+(vendored tauri 2.12.5, `async_runtime.rs:300`:
+`pub fn spawn<F>(task: F) -> JoinHandle<F::Output>`
+where `F: Future + Send + 'static`, `F::Output: Send +
+'static`). Each spawned body is byte-identical to before.
+The `tokio::time::interval` inside the tick task is
+unchanged — it now runs inside a task on the runtime.
+Audit: no other `tokio::spawn` / `tokio::task::spawn`
+outside a runtime context anywhere in `lib.rs` or
+`main.rs` (main.rs is just `fetchline_lib::run()`); the
+only other `tokio` use in the shell is that `interval`
+call. `tokio::spawn` inside `async fn` Tauri commands is
+fine (commands run on Tauri's async runtime) and was left
+alone. The startup.log diagnostics stay in place — after
+the fix the log should reach "spawns done" and "setup ok",
+and "frontend reached backend: get_settings ok" once the
+frontend mounts. BUG-030 stays FIXED.
+Regression test kept: none added — the failure is a
+runtime-context panic in the Tauri shell, which never runs
+on this VM; the CI run after the push is the proof, and the
+user's next `startup.log` is the launch proof.
+Verified: full suite 411/411 pass, 0 failed (56 unit + 17
+antivirus + 112 integration + 32 extension + 4
+final-verify2 + 16 final-verify + 28 grabber + 14 verifier
++ 14 kerberos + 14 options + 7 progress + 15 proxy + 19
+quota + 23 sync + 9 update + 31 video + 0 doc);
+`cargo check --tests` 0 warnings; `npm run build` passes
+(✓ built in 4.11s); parity unchanged 85.4/100 (must-haves
+17/17). `tauri::async_runtime::spawn` signature verified
+against vendored tauri 2.12.5 (`async_runtime.rs:300`).
+Tauri lib still uncheckable on this VM — the CI run after
+the push is the proof.
+File: `app/src-tauri/src/lib.rs` (6 lines) + this log +
+`replica/build-log.md`.
+
+## Known limitations, not bugs (round-24 additions)
+
+- The Tauri shell never compiles or runs on this VM, so a
+  bug like BUG-029 — a panic that only happens when the
+  shell actually runs — can only be caught by launching the
+  built app on real Windows. BUG-027/028/030 were compile
+  errors CI caught; BUG-029 was a runtime error only a
+  launch could catch, and the startup.log diagnostics are
+  what caught it.
+- The fix is a spawn-site change only; no download behaviour
+  changed. The next proof is the user's `startup.log` from
+  the fixed build ending with "setup ok" and "frontend
+  reached backend: get_settings ok".

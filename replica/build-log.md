@@ -2295,3 +2295,8 @@ check and download quota untouched, as instructed.
   (must-haves 17/17). Tauri lib still uncheckable on this VM —
   the CI run after the push is the proof. BUG-029 stays OPEN.
   Licence (S11) untouched.
+
+## BUG-029 ROOT CAUSE FOUND + FIXED — `tokio::spawn` in setup panics with no reactor — 2026-11-15
+- The user's `startup.log` from the run-#7 instrumented build (launched 07:47:21 EET) ends: `settings applied`, then `PANIC at src\lib.rs:793:13: there is no reactor running, must be called from the context of a Tokio 1.x runtime`. The `.setup` closure runs synchronously on the main thread outside any Tokio runtime, but called `tokio::spawn` six times — the first call panics, the process exits cleanly (code 101, no WER entry) before the event loop starts. WebView2 is FINE (157.0.4341.46 logged). Latent since the first build; not a Windows-only quirk.
+- Fix: all six setup `tokio::spawn` calls in `app/src-tauri/src/lib.rs` (lines 793/802/813/824/834/839) are now `tauri::async_runtime::spawn` — Tauri's own runtime handle, the correct way to spawn from setup (signature verified against vendored tauri 2.12.5, `async_runtime.rs:300`). Spawned bodies byte-identical; `tokio::time::interval` inside the tick task unchanged. Audit: no other `tokio::spawn` outside a runtime context in `lib.rs` or `main.rs`. Startup.log diagnostics stay in place.
+- Verified: full suite 411/411 pass, `cargo check --tests` 0 warnings, `npm run build` passes, parity unchanged 85.4/100 (must-haves 17/17). Tauri lib still uncheckable on this VM — the CI run after the push is the proof, and the user's next `startup.log` (should end "setup ok" + "frontend reached backend") is the launch proof. BUG-029 FIXED, BUG-030 stays FIXED. Licence (S11) untouched.

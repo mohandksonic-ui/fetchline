@@ -790,7 +790,7 @@ pub fn run() {
             // Forward engine progress events to the frontend.
             let handle = app.handle().clone();
             let mut rx = manager.subscribe();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 while let Ok(event) = rx.recv().await {
                     let _ = handle.emit("download-progress", event);
                 }
@@ -799,7 +799,7 @@ pub fn run() {
             // countdown dialog for shutdown / hibernate).
             let action_handle = app.handle().clone();
             let mut arx = manager.subscribe_actions();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 while let Ok(action) = arx.recv().await {
                     let _ = action_handle.emit("queue-action-pending", action);
                 }
@@ -810,7 +810,7 @@ pub fn run() {
             // tick in the engine — there is no second scheduler.
             let update_handle = app.handle().clone();
             let mut urx = manager.subscribe_update_checks();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 while let Ok(result) = urx.recv().await {
                     let _ = update_handle.emit("update-available", result);
                 }
@@ -821,7 +821,7 @@ pub fn run() {
             // within 30 s, and links caught while it was closed are
             // drained once at startup (below).
             let tick_manager = Arc::clone(&manager);
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(30));
                 loop {
                     interval.tick().await;
@@ -831,12 +831,12 @@ pub fn run() {
             });
             // Links the extension caught while the app was closed.
             let drain_manager = Arc::clone(&manager);
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 let _ = drain_manager.drain_pending_links().await;
             });
             // Queues flagged "start on startup" begin draining once.
             let startup_manager = Arc::clone(&manager);
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 let _ = startup_manager.start_startup_queues().await;
             });
             log_startup(log, "spawns done");
