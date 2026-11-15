@@ -692,16 +692,18 @@ impl SspiInitiator {
 impl SpnegoInitiator for SspiInitiator {
     fn step(&mut self, input_token: Option<&[u8]>) -> Result<SpnegoStep> {
         use sspi::*;
-        // Input token, when the proxy sent one.
-        let mut in_buf = SecBuffer { cb_buffer: 0, buffer_type: SECBUFFER_TOKEN, pv_buffer: std::ptr::null_mut() };
+        // Input token, when the proxy sent one. The buffer is only
+        // built when a token exists, so there is no placeholder
+        // assignment that is never read (BUG-027 warning fix).
+        let mut in_buf: Option<SecBuffer> = None;
         let mut in_desc = SecBufferDesc { ul_version: SECBUFFER_VERSION, c_buffers: 0, p_buffers: std::ptr::null_mut() };
         if let Some(token) = input_token {
-            in_buf = SecBuffer {
+            in_buf = Some(SecBuffer {
                 cb_buffer: token.len() as u32,
                 buffer_type: SECBUFFER_TOKEN,
                 pv_buffer: token.as_ptr() as *mut std::ffi::c_void,
-            };
-            in_desc = SecBufferDesc { ul_version: SECBUFFER_VERSION, c_buffers: 1, p_buffers: &mut in_buf };
+            });
+            in_desc = SecBufferDesc { ul_version: SECBUFFER_VERSION, c_buffers: 1, p_buffers: in_buf.as_mut().unwrap() };
         }
         // Output buffer: Kerberos tokens fit in 16 KiB in practice;
         // SEC_E_INSUFFICIENT_MEMORY would surface as an error below.

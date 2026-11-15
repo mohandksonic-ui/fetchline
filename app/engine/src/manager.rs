@@ -22,7 +22,6 @@
 //!    server's message.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -4172,6 +4171,32 @@ impl DownloadManager {
 
 // -- segment task ----------------------------------------------------------
 
+/// Cross-platform positional write: write `buf` at absolute `offset`
+/// in `file` and return the bytes written — the same semantics on
+/// both platforms (a partial write is possible, like `File::write`).
+/// Unix uses `FileExt::write_at`; Windows uses
+/// `FileExt::seek_write` (the Unix-only import broke the first
+/// Windows build, BUG-027). Callers keep their existing logic
+/// unchanged; only this primitive is platform-gated.
+#[cfg(unix)]
+fn write_at_pos(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(buf, offset)
+}
+
+/// Cross-platform positional write: write `buf` at absolute `offset`
+/// in `file` and return the bytes written — the same semantics on
+/// both platforms (a partial write is possible, like `File::write`).
+/// Windows uses `FileExt::seek_write`; Unix uses `FileExt::write_at`
+/// (the Unix-only import broke the first Windows build, BUG-027).
+/// Callers keep their existing logic unchanged; only this primitive
+/// is platform-gated.
+#[cfg(windows)]
+fn write_at_pos(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(buf, offset)
+}
+
 /// Download one segment, retrying with exponential backoff.
 /// Stops early when paused, when its (possibly split) end is reached,
 /// or when the segment is complete. `max_attempts` comes from
@@ -4458,7 +4483,7 @@ async fn download_segment_once(
         per_download.acquire(take as u64).await;
         {
             let f = file.lock().unwrap();
-            f.write_at(&chunk[..take], offset)?;
+            write_at_pos(&f, &chunk[..take], offset)?;
         }
         {
             let mut st = state.lock().unwrap();
@@ -4522,7 +4547,7 @@ async fn download_segment_ftp(
         per_download.acquire(take as u64).await;
         {
             let f = file.lock().unwrap();
-            f.write_at(&buf[..take], offset)?;
+            write_at_pos(&f, &buf[..take], offset)?;
         }
         {
             let mut st = state.lock().unwrap();
@@ -4618,7 +4643,7 @@ async fn download_segment_kerberos(
         per_download.acquire(take as u64).await;
         {
             let f = file.lock().unwrap();
-            f.write_at(&buf[..take], offset)?;
+            write_at_pos(&f, &buf[..take], offset)?;
         }
         {
             let mut st = state.lock().unwrap();
@@ -4693,7 +4718,7 @@ async fn download_segment_ntlm(
         per_download.acquire(take as u64).await;
         {
             let f = file.lock().unwrap();
-            f.write_at(&buf[..take], offset)?;
+            write_at_pos(&f, &buf[..take], offset)?;
         }
         {
             let mut st = state.lock().unwrap();
@@ -4908,5 +4933,58 @@ fn default_downloads_dir() -> PathBuf {
         PathBuf::from(home).join("Downloads")
     } else {
         PathBuf::from("downloads")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    /// BUG-027 regression: the segment writer used Unix-only
+    /// `FileExt::write_at`, which broke the first Windows build.
+    /// `write_at_pos` must write at exact offsets on every platform:
+    /// chunks written out of order (and one overlapping rewrite) must
+    /// read back byte-exact.
+    #[test]
+    fn write_at_pos_writes_out_of_order_byte_exact() {
+        let path = std::env::temp_dir().join(format!(
+            "fetchline-write-at-pos-{}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            // Pre-size like the segment writer does for a known size.
+            f.set_len(12).unwrap();
+            // Out of order: tail first, then head, then an overlap.
+            let n = write_at_pos(&f, b"world", 6).unwrap();
+            assert_eq!(n, 5);
+            let n = write_at_pos(&f, b"hello ", 0).unwrap();
+            assert_eq!(n, 6);
+            let n = write_at_pos(&f, b"!", 11).unwrap();
+            assert_eq!(n, 1);
+            // Overlapping rewrite: replace the space at offset 5.
+            let n = write_at_pos(&f, b"-", 5).unwrap();
+            assert_eq!(n, 1);
+            // Zero-length write at the end is a no-op, not an error.
+            let n = write_at_pos(&f, b"", 12).unwrap();
+            assert_eq!(n, 0);
+            f.flush().unwrap();
+        }
+        let mut back = Vec::new();
+        {
+            let mut f = std::fs::File::open(&path).unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.read_to_end(&mut back).unwrap();
+        }
+        assert_eq!(&back, b"hello-world!");
+        // A read at a non-zero offset sees the same bytes.
+        let mut f = std::fs::File::open(&path).unwrap();
+        f.seek(SeekFrom::Start(6)).unwrap();
+        let mut tail = [0u8; 5];
+        f.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"world");
+        let _ = std::fs::remove_file(&path);
     }
 }

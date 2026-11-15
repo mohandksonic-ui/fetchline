@@ -1998,3 +1998,87 @@ with `scan_status: None`). Verified: full suite re-run green —
 - A real scanner (e.g. Windows Defender's MpCmdRun) against a
   real finished download on Windows: exit codes, output text
   and timing of a genuine scan.
+
+## Round 20 — First Windows build failure (CI run 43674541575) — 2026-11-15
+
+### BUG-027: Unix-only `FileExt::write_at` breaks the Windows build — 5 compile errors in `fetchline-engine`
+
+- Severity: S2
+- Flow / case: F01 (segmented download write path), CI Windows build
+- Screen: S01/S03 (engine: `Manager::run_segment` and friends)
+- Build: 2026-11-15 (first GitHub Actions Windows build, run 43674541575, job 132691688464)
+
+Steps
+1. Push the repo to GitHub; the `Build Windows installer` workflow
+   runs on `windows-latest`.
+2. The frontend builds fine ("✓ built in 3.87s").
+3. Step 9 (`npx --yes @tauri-apps/cli@2 build`, working dir `app`)
+   fails compiling `fetchline-engine`.
+
+Expected: the engine compiles on Windows and the MSI + NSIS
+installer is produced.
+Actual: 5 errors, all in `app/engine/src/manager.rs`:
+`error[E0433]: cannot find 'unix' in 'os'` at manager.rs:25
+(`use std::os::unix::fs::FileExt;`, "the item is gated behind the
+`unix` feature"), plus four `error[E0599]: no method named
+'write_at' for 'MutexGuard<'_, File>'` at manager.rs:4461, 4525,
+4621, 4696. Final line: "error: could not compile
+`fetchline-engine` (lib) due to 5 previous errors".
+Evidence: CI run 43674541575 step 9, exit code 1, 4m 22s; the
+engine-tests step (step 8, `cargo test` in `app/engine`,
+continue-on-error) also exited 1 on Windows — the same compile
+failure, since `cargo test` compiles the same lib (it never got
+to run any test).
+Suspected cause: the segment writer used Unix-only positional
+I/O (`std::os::unix::fs::FileExt::write_at`). The Tauri shell
+never compiled on the Linux VM, so no Windows compile had ever
+been attempted before this CI run — the Unix-only import was
+invisible to every local check.
+Status: FIXED. New cfg-gated helper `write_at_pos` in
+`app/engine/src/manager.rs`: Unix keeps `FileExt::write_at`,
+Windows uses `FileExt::seek_write` (same semantics — write `buf`
+at absolute `offset`, returns bytes written); the top-level
+Unix-only import is gone and all 4 call sites go through the
+helper. Linux write semantics are unchanged (same offsets, same
+partial-write handling — callers already assumed the full `take`
+bytes, as before). A whole-workspace sweep found no other
+Unix-only compile blocker: the only other `std::os::unix`
+reference was this import; `open_path` (queue.rs),
+`execute_action` (rasdial/shutdown/hibernate), `play_wav_file`
+(PowerShell SoundPlayer) and the SSPI/DPAPI FFI are all
+`#[cfg(target_os = "windows")]`-gated with honest errors off
+Windows; `host` (`db_candidates`) checks `%APPDATA%` first and
+`default_downloads_dir` checks `USERPROFILE` first. The
+kerberos.rs:696 unused-assignment warning was also fixed
+properly (the input `SecBuffer` is now built only when a token
+exists — `Option<SecBuffer>` — no `#[allow]`).
+Regression test kept: `manager::tests::write_at_pos_writes_out_of_order_byte_exact`
+in `app/engine/src/manager.rs` (writes "world" at 6, "hello " at
+0, "!" at 11, an overlapping rewrite at 5 and a zero-length write
+at the end; reads back byte-exact `hello-world!`).
+Verified: full suite 411/411 pass, 0 failed (was 410/410; +1 new
+test); `cargo check --tests` 0 warnings; `npm run build` passes;
+parity unchanged 85.4/100 (must-haves 17/17). Windows
+cross-check attempted: `rustup target add x86_64-pc-windows-gnu`
+succeeded, but `cargo check --target x86_64-pc-windows-gnu -p
+fetchline-engine` is blocked on this VM by a missing MinGW C
+compiler (`cc-rs: failed to find tool "x86_64-w64-mingw32-gcc"`;
+`apt-get install -s gcc-mingw-w64-x86-64` cannot even locate the
+package) — so instead every `cfg(windows)` block was audited by
+hand (SSPI FFI signatures/arity vs Win32, DPAPI signatures,
+`seek_write` signature, src-tauri has no cfg blocks). Windows
+compilation is therefore NOT proven locally; the CI run after
+upload is the proof. File: `app/engine/src/manager.rs`
+(`write_at_pos`, 4 call sites, regression test),
+`app/engine/src/kerberos.rs` (warning fix).
+
+## Known limitations, not bugs (round-20 additions)
+
+- The Windows GNU cross-check could not run on this VM (no
+  MinGW gcc); Windows compilation of the fixed code is proven
+  only by the CI run after the user uploads the fix.
+- The engine-tests step also exited 1 on the failed CI run; the
+  evidence points at the same compile failure (cargo test
+  compiles the same lib), but Windows *runtime* test failures
+  beyond compilation cannot be ruled out until a green CI run
+  shows the step passing.

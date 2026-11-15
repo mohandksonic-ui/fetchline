@@ -2182,3 +2182,36 @@ check and download quota untouched, as instructed.
   Defender / real AV behaviour on Windows (exit codes, output
   text, timing) remains unproven. Licence (S11) untouched, as
   instructed.
+
+## BUG-027 — First Windows build failure (Unix-only `write_at`): fixed (2026-11-15)
+
+- The first GitHub Actions Windows build (run 43674541575) failed
+  at step 9 (`tauri build`): the frontend built fine, but
+  `fetchline-engine` failed with 5 errors — `use
+  std::os::unix::fs::FileExt` at manager.rs:25 plus four
+  `write_at` call sites. The engine-tests step (step 8) exited 1
+  too, almost certainly the same compile failure (cargo test
+  compiles the same lib).
+- Fix: cfg-gated `write_at_pos` helper in
+  `app/engine/src/manager.rs` (Unix `write_at`, Windows
+  `seek_write`, same semantics); top-level Unix-only import
+  removed; all 4 call sites converted; Linux behaviour unchanged.
+  Whole-workspace sweep found no other Unix-only compile blocker
+  (all other platform branches are cfg-gated; `host` checks
+  `%APPDATA%` first). Kerberos SSPI warning at kerberos.rs:696
+  fixed by restructuring (input buffer built only when a token
+  exists), no `#[allow]`.
+- Regression test kept:
+  `manager::tests::write_at_pos_writes_out_of_order_byte_exact`
+  (out-of-order + overlapping writes read back byte-exact).
+- Verified: full suite 411/411 pass (was 410/410, +1), `cargo
+  check --tests` 0 warnings, `npm run build` passes, parity
+  unchanged 85.4/100. Windows cross-check attempted but blocked
+  on this VM (MinGW gcc missing, apt cannot locate the package);
+  every `cfg(windows)` block was audited by hand instead, and
+  the CI run after upload is the real proof.
+- Delivered by pushing the changed files to GitHub directly
+  (the connector write access was fixed by the user's full
+  disconnect + reconnect) — the push re-triggers the workflow.
+  No workflow change was needed (the failure was product code,
+  not the workflow). Licence (S11) untouched.
