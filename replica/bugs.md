@@ -2532,6 +2532,54 @@ File: `app/engine/tests/engine_tests.rs`,
 `app/engine/tests/grabber_tests.rs`,
 `app/engine/tests/antivirus_tests.rs` + this log.
 
+## Round 26 — BUG-032: `protect_round_trip` test fails on Windows whenever DPAPI works — 2026-11-15
+
+### BUG-032: FIXED — secret-storage test asserted the Linux form on every platform
+
+- Severity: S2
+- Flow / case: `cargo test` (lib target) on Windows
+- Screen: engine (`app/engine/src/secret.rs`)
+- Build: 2026-11-15 (found by CI run 43708063352, head
+  159dab06 — the user's manual workflow upload; the
+  "Engine tests" step failed 55/56 with this one failure,
+  now visible because `continue-on-error` was removed)
+
+Steps
+1. On Windows, run `cargo test` in `app/engine`.
+2. The lib target fails one test:
+   `secret::tests::protect_round_trip_off_windows` panics
+   at `src/secret.rs:209` (`assert!(stored.starts_with("b64:"))`),
+   the message being the stored value starting `dpapi:`.
+
+Expected: the test passes on every platform.
+Actual: it passes only when DPAPI happens to fail.
+
+Root cause: the test was written for Linux — it pinned
+the `b64:` obfuscated form. But `protect_secret` on
+Windows returns `dpapi:...` whenever DPAPI succeeds, and
+falls back to `b64:` only when DPAPI fails (locked
+profile, service account). So on Windows the test is
+environment-flaky: it passed in earlier CI runs because
+DPAPI failed on the runner then, and failed in run
+43708063352 because DPAPI worked. The failure is in the
+test only — `protect_secret` / `unprotect_secret` behave
+as designed on both paths.
+
+Fix (test-only, no engine change): the test is renamed
+`protect_round_trip` and now pins the round-trip plus the
+two known prefixes, never which one —
+`starts_with("b64:") || starts_with("dpapi:")`,
+`assert_ne!(stored, "hunter2")`, round-trip equals
+`"hunter2"`, legacy plain value reads back as-is. A
+strict `dpapi:` assertion on Windows would have been
+the same flakiness in reverse, so it was not used.
+Regression test kept: the renamed test itself.
+Verified: `cargo test --lib` 56/56 pass on Linux;
+`cargo check --tests` 0 warnings. Windows proof is the
+CI run after the push (Engine tests step now fails
+visibly without `continue-on-error`).
+File: `app/engine/src/secret.rs` + this log.
+
 ## Known limitations, not bugs (round-24 additions)
 
 - The Tauri shell never compiles or runs on this VM, so a

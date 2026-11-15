@@ -201,12 +201,21 @@ mod tests {
     }
 
     #[test]
-    fn protect_round_trip_off_windows() {
-        // On this Linux VM the value is only obfuscated — the test
-        // pins the format (prefix + recoverable) rather than any
-        // security property.
+    fn protect_round_trip() {
+        // The stored form is platform-dependent: `dpapi:` on
+        // Windows when DPAPI works, `b64:` elsewhere — and `b64:`
+        // on Windows too when DPAPI fails (locked profile,
+        // service account). The test pins the round-trip and the
+        // two known prefixes, never which one, so it is
+        // deterministic on every platform. (BUG-032: the old
+        // test asserted `b64:` unconditionally and failed on
+        // Windows whenever DPAPI worked.)
         let stored = protect_secret("hunter2");
-        assert!(stored.starts_with("b64:"), "{stored}");
+        assert!(
+            stored.starts_with("b64:") || stored.starts_with("dpapi:"),
+            "{stored}"
+        );
+        assert_ne!(stored, "hunter2");
         assert_eq!(unprotect_secret(&stored).unwrap(), "hunter2");
         assert_eq!(unprotect_secret("legacy-plain").unwrap(), "legacy-plain");
     }
