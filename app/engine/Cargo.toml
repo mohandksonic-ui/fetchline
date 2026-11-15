@@ -23,3 +23,6 @@ tokio = { version = "1", features = ["full"] }
 # Only used by the settings-migration test, which builds a pre-migration
 # database file by hand.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Only used by real_download_tests.rs (SHA-256 of the pinned file).
+# Test-only: it does not ship in the app.
+sha2 = "0.10"

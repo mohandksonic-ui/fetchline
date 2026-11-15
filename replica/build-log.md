@@ -2351,3 +2351,84 @@ check and download quota untouched, as instructed.
   and check `.ExitCode` (null or non-zero = fail, with the install.log tail
   printed). Everything else in the step is unchanged (the startup.log path
   was already correct: `$env:APPDATA\com.fetchline.app\fetchline\startup.log`).
+
+## Real download test + browser capture test (CI, Windows runner) — 2026-11-15
+
+The launch smoke test proved the app opens; these two close the next
+gaps: that it actually DOWNLOADS on Windows, and that a browser link
+reaches it on Windows. Both were built the same day the smoke test
+went green (run 43686477003).
+
+### TEST 1 — real download (`app/engine/tests/real_download_tests.rs`, 2 tests)
+- Downloads Fetchline's own LICENSE from a PINNED commit (7255dff9)
+  via raw.githubusercontent.com through the REAL DownloadManager
+  (probe + add_download + start + segments) and verifies the bytes:
+  1,079 bytes, SHA-256
+  `c2ef3696eecd8d51c0e615afe9437e5d620abcd9272b9d9f4bcbbd1e4a95f793`.
+  The pinned URL was verified byte-identical to the repo copy
+  2026-11-15. New dev-dependency `sha2 = "0.10"` (test-only, does
+  not ship in the app) + `Cargo.lock` update.
+- CI: dedicated step "Real download test (fails the run)" with NO
+  continue-on-error (step-8 `cargo test` unchanged, still
+  continue-on-error). The step sets `FETCHLINE_REAL_DOWNLOAD_TEST=1`.
+- Env gate (honest limit): without the env var both tests print
+  SKIPPED and pass. The Linux dev VM sits behind a TLS-intercepting
+  egress proxy (its `Hatch Sandbox Egress CA` is in the system
+  store, so curl trusts it), but the engine's rustls client uses
+  compiled-in webpki roots and rejects it
+  (`InvalidCertificate(UnknownIssuer)`) — verified 2026-11-15: both
+  tests fail ungated on this VM, skip cleanly gated. The Windows
+  runner has direct internet and no intercepting proxy, so they run
+  for real there. Never weaken TLS verification to make them pass
+  locally. If the repo is renamed, update the pinned URL in the
+  test (the hash stays the same — the LICENSE text does not change).
+
+### TEST 2 — browser capture (`scripts/capture-test.py`, CI job `extension-capture-test`)
+- New job (needs build-windows, windows-latest, 20 min timeout) in
+  three phases, driven by `scripts/capture-test.py`:
+  1. host: the real `fetchline-host.exe` (built on the runner from
+     `app/host`), driven with real Native Messaging frames (ping,
+     get_settings, download_link) against the app's real `app.db`;
+     the pending_links row is read back from SQLite (source
+     `browser`, status `pending`). Dry-run on this VM against the
+     local host binary: PASSED (ping pong, get_settings
+     browser_integration=true, download_link queued with
+     pending_link_id, row confirmed).
+  2. browser: the unpacked extension loads in headless Chrome, its
+     ID is discovered (CDP `/json/list`, Preferences fallback), the
+     host manifest + HKCU registry key are written exactly as a
+     user install would, `popup.html` is opened and its status text
+     polled over CDP (websocket-client) until it reports
+     "Connected to the Fetchline desktop app".
+  3. drain: the installed app drains the queue and downloads the
+     pinned LICENSE; the script verifies its SHA-256 in
+     `%USERPROFILE%\Downloads` (the correct landing spot: a
+     no-extension file falls back to category `cat-documents`,
+     whose default folder is empty, so the folder resolution falls
+     through to the OS Downloads folder).
+- PACKAGING GAP (finding, not a workaround to hide): the MSI ships
+  NO `fetchline-host.exe` and creates NO native-messaging registry
+  key — `tauri.conf.json` has no bundle config for either, and the
+  Tauri app does not depend on the host crate (the repo host
+  manifests point at `C:\Program Files\Fetchline\fetchline-host.exe`,
+  a path that does not exist after installing the MSI). The job
+  builds the host and registers it itself, runner-only. Until the
+  installer ships the host + key, a user install cannot capture
+  from a browser at all, however green this job is.
+- Limits: a human right-click ("Download with Fetchline") or the
+  download watcher cannot be driven in headless Chrome (no mouse,
+  no real popup window). Those use the same `sendNativeMessage` +
+  `handToFetchline` code Phase 2 exercises, and the menu/watcher
+  wiring is covered by the Node fake-`chrome` tests. Phase 2 (CDP
+  polling via websocket-client, extension-ID discovery) is the
+  riskiest part — reviewed-only on this VM (no Chrome here); the
+  CI run is the proof.
+- Verified on Linux: full engine suite 413/413, 0 failed (411 + 2
+  new, the new ones SKIPPED ungated); `cargo check --tests`
+  0 warnings; `npm run build` passes; workflow YAML parses and
+  re-reads correctly (jobs build-windows + smoke-test +
+  extension-capture-test; real-download step has no
+  continue-on-error, step-8 still does); `scripts/capture-test.py`
+  compiles (`py_compile`) and Phase 1 dry-runs green locally.
+  No product behaviour changed; no licence work; no IDM code,
+  assets or wording.

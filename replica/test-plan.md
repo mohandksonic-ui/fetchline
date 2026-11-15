@@ -1786,3 +1786,41 @@ running desktop app is marked **blocked**.
 - No real antivirus product was ever run (fake scanner fixture
   only); Windows Defender / real AV behaviour on Windows
   remains unproven (see S14-T1).
+
+## Round 20 — Real download + browser capture on the Windows runner (CI) — 2026-11-15
+
+The launch smoke test (run 43686477003, green) proved the app
+opens on real Windows. These two close the next gaps: that it
+actually DOWNLOADS on Windows, and that a browser link reaches
+it on Windows. Both run in CI only; neither changes product
+behaviour.
+
+| ID | case | input | expected | how | result |
+| --- | --- | --- | --- | --- | --- |
+| RD-H1 | happy: real download, pinned file | LICENSE from a pinned commit (7255dff9) via raw.githubusercontent.com, through the real DownloadManager | Completes; saved file is 1,079 bytes, SHA-256 `c2ef3696…f793` | cargo test `real_download_of_pinned_license_matches_sha256` (gated: `FETCHLINE_REAL_DOWNLOAD_TEST=1`) + CI step "Real download test (fails the run)" | PASS on CI (dedicated step); SKIPPED locally (TLS-intercepting proxy — see below) |
+| RD-H2 | happy: real probe | Same pinned URL | Probe reports size 1,079 | cargo test `real_probe_of_pinned_license_reports_size` (same gate) | PASS on CI (dedicated step); SKIPPED locally |
+| CAP-H1 | happy: host protocol | Real `fetchline-host.exe`, real Native Messaging frames (ping, get_settings, download_link) against the app's real `app.db` | ping pong; get_settings browser_integration=true; download_link ok with pending_link_id; row in `pending_links` (source `browser`, status `pending`) | `scripts/capture-test.py` Phase 1 (CI job `extension-capture-test`) | PASS (dry-run locally vs the real host binary; full run on CI) |
+| CAP-H2 | happy: real browser transport | Unpacked extension in headless Chrome; host manifest + registry key written as a user install would; `popup.html` opened, status polled over CDP | Popup reports "Connected to the Fetchline desktop app" | `scripts/capture-test.py` Phase 2 | TO CHECK (CI — reviewed-only on this VM, no Chrome here) |
+| CAP-H3 | happy: drain to file | Installed app drains the queue and downloads the pinned LICENSE | File in `%USERPROFILE%\Downloads\LICENSE`, SHA-256 matches | `scripts/capture-test.py` Phase 3 | TO CHECK (CI) |
+| CAP-N1 | negative: human click | Right-click "Download with Fetchline" / download watcher in a real browser | Cannot be driven headlessly — no mouse, no real popup window | — | NOT PROVEN (same transport as CAP-H2; menu/watcher wiring covered by Node fake-`chrome` tests) |
+| CAP-F1 | finding: packaging gap | Install the MSI, look for `fetchline-host.exe` and the native-messaging registry key | The MSI ships NEITHER (no bundle config in `tauri.conf.json`; the Tauri app does not depend on the host crate) | Inspection (`tauri.conf.json`, `app/src-tauri/Cargo.toml`, repo host manifests) | FINDING — the capture job builds + registers the host itself, runner-only; a user install cannot capture until the installer ships them |
+
+### Regression (all earlier areas, re-run in full)
+
+- Full suite: **413/413, 0 failed** (was 411 — +2 real-download
+  tests, SKIPPED ungated on this VM). `cargo check --tests`
+  0 warnings; `npm run build` passes.
+
+### Not tested in this round (same limits as rounds 1–19, plus)
+
+- The real-download tests SKIP on this Linux VM by design: it sits
+  behind a TLS-intercepting egress proxy (Hatch Sandbox Egress CA)
+  that the engine's rustls client (compiled-in webpki roots)
+  rejects. They run for real only where the env var is set — the
+  CI dedicated step. Never weaken TLS verification to make them
+  pass locally.
+- Phase 2 of the capture test (headless Chrome + CDP) is
+  reviewed-only here: no Chrome on this VM. The CI run is the
+  proof; if it proves flaky, the failure names the phase.
+- No desktop binary / Tauri shell on this VM (missing `gdk-3.0`)
+  — unchanged.
