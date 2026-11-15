@@ -121,6 +121,7 @@ impl MiniVideoServer {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let b = b.clone();
                         let name = name.clone();
                         let body = playlist_body.clone();

@@ -117,6 +117,7 @@ impl MockServer {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let vv = Arc::clone(&v);
                         let ee = Arc::clone(&ev);
                         let ll = Arc::clone(&lm);
@@ -433,6 +434,7 @@ impl PageServer {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let page = page.clone();
                         thread::spawn(move || handle_page(stream, &page));
                     }
@@ -568,6 +570,7 @@ impl HttpProxyServer {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let h = Arc::clone(&h);
                         let a = Arc::clone(&a);
                         let e = Arc::clone(&e);
@@ -725,6 +728,7 @@ impl Socks5Server {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let h = Arc::clone(&h);
                         let a = Arc::clone(&a);
                         let auth = auth.clone();
@@ -906,6 +910,7 @@ impl GrabberSite {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let b = b.clone();
                         thread::spawn(move || handle_grabber(stream, &b, robots));
                     }

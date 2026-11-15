@@ -2791,6 +2791,204 @@ test and reworked capture job run for the first time
 on this workflow.
 File: `app/engine/tests/antivirus_tests.rs` + this log.
 
+## Round 30 — BUG-036/037/038: the 42 Windows failures — accepted sockets inherit non-blocking mode, SSPI Negotiate falls back to NTLM, open-folder test deletes the open DB — 2026-11-15
+
+### BUG-036: FIXED — every test stub's accepted socket is non-blocking on Windows, so multi-round-trip handlers fail instantly
+
+- Severity: S2 (test-only; blocks the whole Windows suite)
+- Flow / case: `cargo test --no-fail-fast` on Windows
+  (VPS full-suite run, head 2697d0ec): 412 tests, 370
+  passed, 42 failed, 10 of 18 binaries failed
+- Screen: engine tests
+  (`app/engine/tests/common/mock.rs`,
+  `tests/proxy_tests.rs`, `tests/kerberos_tests.rs` and
+  every other test file with a stub server)
+- Build: 2026-11-15 (found by the VPS full-suite run
+  2026-11-15 ~14:44 EET; isolated and proven by a
+  raw-socket diagnostic the same day)
+
+Steps
+1. On Windows, run `cargo test --no-fail-fast` in
+   `app/engine`.
+2. 42 tests fail. The dominant family (~32) is WinSock
+   10053 `WSAECONNABORTED` — Windows aborts connections
+   to the hand-rolled TCP stub servers (FTP, SOCKS5,
+   NTLM/Kerberos proxy stubs, sync tests) — while plain
+   HTTP downloads through the same fixture server pass.
+   One SOCKS5 test fails differently: the stub replies
+   `REP=7 Command not supported`.
+
+Expected: the stubs answer every round trip, on both
+platforms.
+Actual: on Windows the stubs close the connection
+mid-handshake (FTP probe dies with 10053 in 0.09 s;
+the SOCKS5 stub answers REP=7).
+
+Root cause: every stub server sets its listener
+non-blocking (`listener.set_nonblocking(true)`) so the
+accept loop can poll the stop flag — and on Windows an
+accepted socket INHERITS the listener's non-blocking
+mode (on Linux accepted sockets are always blocking).
+Every handler then does blocking-style reads
+(`read_line`, `read_exact`, single `read`) on a
+non-blocking socket: the read returns `WouldBlock`
+the moment the peer's bytes have not arrived yet,
+the handler treats any read error as "client gone"
+and returns, dropping the socket while the client's
+bytes are still unread in its receive buffer — so
+the drop sends RST and the client sees 10053. The
+pattern fits exactly: single-shot stubs (plain HTTP
+mock, page server, grabber site) mostly work because
+the client sends its whole request before the
+handler's one read runs; multi-round-trip stubs
+(FTP control connection, SOCKS5 handshake, NTLM /
+Kerberos 407 loops) fail deterministically because
+the server must read a second time, after its own
+first reply, and that read races the client's
+response. The SOCKS5 REP=7 is the same race: the
+stub's `read_exact` for the CONNECT header hits
+`WouldBlock` before the client's request arrives
+and the stub misreads it as a bad command.
+Proven, not guessed: a temporary raw-socket
+diagnostic (`tests/raw_probe_tests.rs`, deleted
+before pushing) ran on the VPS — the raw std SOCKS5
+handshake PASSED (stub fine, engine client loses
+the race under tokio scheduling), while the raw std
+FTP handshake FAILED with 10053 right after the
+greeting: the stub's first `read_line` returned
+instantly instead of waiting for `USER`. On a
+blocking socket that read would have waited.
+Windows Defender (real-time + NIS on) was checked
+and is NOT the cause: the failures are
+deterministic in isolation, in 0.09 s, with no
+load.
+
+Fix (test-only): after every `accept()` from a
+non-blocking listener, put the accepted stream back
+in blocking mode first —
+`stream.set_nonblocking(false).unwrap()` — 17 sites
+in 10 files (5 in `tests/common/mock.rs`: MockServer,
+PageServer, HttpProxyServer, Socks5Server,
+GrabberSite; 2 in `tests/proxy_tests.rs`: FTP +
+NTLM proxy; 2 in `tests/kerberos_tests.rs`; 1 each
+in `extension_tests.rs`, `video_tests.rs`,
+`grabber_verify_tests.rs`, `final_verify_tests.rs`,
+`options_tests.rs`, `final_verify2_tests.rs` x2,
+`update_tests.rs`). The listeners stay non-blocking
+(the accept loops still poll); only the accepted
+streams change, which makes Windows behave exactly
+like Linux — the semantics every handler already
+assumes. No engine code, no test assertions, no
+timeouts changed.
+Regression test kept: the 42 failing tests
+themselves (they now exercise the same stubs on
+both platforms).
+Verified: `cargo check --tests` 0 warnings; full
+engine suite on Linux 413/413 pass (lib 56,
+antivirus 17, engine_tests 112, all other targets
+green — the 112th engine test is the
+`#[cfg(not(windows))]` shutdown test, so Windows
+runs 412). Windows proof is the VPS full-suite
+re-run after the push.
+File: the 10 test files above + this log.
+
+### BUG-037: FIXED — SSPI `Negotiate` package silently produces an NTLM token with no Kerberos credentials
+
+- Severity: S2 (real engine behaviour)
+- Flow / case: `kerberos_only_proxy_fails_clearly_with_real_gssapi_and_never_sends_basic`
+- Screen: engine (`app/engine/src/kerberos.rs`,
+  `SspiInitiator`)
+- Build: 2026-11-15 (found by the VPS full-suite run,
+  head 2697d0ec)
+
+Steps
+1. On Windows, run the Kerberos tests with the real
+   SSPI initiator against a Negotiate-only proxy.
+2. The test asserts no `Negotiate` token is sent when
+   no Kerberos credentials exist — but a token IS sent.
+
+Expected: with no Kerberos ticket, the initiator
+fails cleanly and no token is ever sent (as on Linux,
+where GSSAPI fails with no ticket cache).
+Actual: SSPI produces a token and the engine sends
+`Negotiate <token>` — the `Negotiate` package falls
+back to NTLM inside the package when no Kerberos
+ticket exists, so the "Kerberos" auth silently
+downgrades to NTLM.
+
+Root cause: `SspiInitiator::new` asked SSPI for the
+`Negotiate` package. Negotiate is a meta-package: it
+tries Kerberos, then NTLM, and returns whichever
+works — with the SYSTEM / logon-session credentials
+that always exist on Windows, it returns an NTLM
+token. The setting is Kerberos and the fallback
+order (Kerberos -> NTLM -> Basic) is handled at the
+scheme level, so the silent in-package fallback is
+wrong here: a Kerberos-only proxy must fail clearly,
+and a Negotiate+NTLM proxy must fall back through
+the explicit NTLM exchange, not inside Negotiate.
+
+Fix (engine): ask SSPI for the `Kerberos` package
+directly. With no ticket `InitializeSecurityContext`
+fails and no token is sent; with a ticket it
+produces a real Kerberos AP-REQ. Error strings and
+module docs updated to name the Kerberos package;
+the HTTP `Negotiate` scheme name is untouched.
+Regression test kept: the failing test itself (it
+now asserts the no-token property on both
+platforms).
+Verified: `cargo check --tests` 0 warnings; full
+engine suite on Linux 413/413 pass (SSPI code is
+`#[cfg(windows)]` — it never compiles here, as
+before). Windows proof is the VPS full-suite re-run
+after the push.
+File: `app/engine/src/kerberos.rs` + this log.
+
+### BUG-038: FIXED — `open_folder_validation` deletes the tmpdir while the SQLite DB inside it is still open
+
+- Severity: S3 (test-only)
+- Flow / case: `progress_tests::open_folder_validation`
+  on Windows
+- Screen: engine tests
+  (`app/engine/tests/progress_tests.rs`)
+- Build: 2026-11-15 (found by the VPS full-suite run,
+  head 2697d0ec)
+
+Steps
+1. On Windows, run `open_folder_validation`: download
+   a file into the tmpdir, wait for completion, then
+   `std::fs::remove_dir_all(&dir)`.
+2. The removal fails with Win32 error 32 ("The
+   process cannot access the file because it is being
+   used by another process").
+
+Expected: the folder deletes cleanly, so the test
+can then assert `folder_for_download` reports it
+gone.
+Actual: the removal fails — the SQLite database
+(`app.db`) lives in the same tmpdir and the Store
+holds it open for the whole test. Linux lets you
+unlink open files, so the test passed there;
+Windows refuses.
+
+Root cause: the test used the tmpdir itself as the
+download folder, so deleting "the download folder"
+also deleted the open database. The downloaded
+file's own handle is closed once the download
+completes — only the DB was in the way.
+
+Fix (test-only): the download folder is now a
+`downloads` subdirectory of the tmpdir; the test
+deletes that subfolder instead. Same assertions
+(folder resolves, then "no longer exists" for both
+entry points), same behaviour under test — only the
+folder path moved out from under the open DB.
+Regression test kept: the failing test itself.
+Verified: `cargo check --tests` 0 warnings; full
+engine suite on Linux 413/413 pass. Windows proof is
+the VPS full-suite re-run after the push.
+File: `app/engine/tests/progress_tests.rs` + this log.
+
 ## Known limitations, not bugs (round-24 additions)
 
 - The Tauri shell never compiles or runs on this VM, so a

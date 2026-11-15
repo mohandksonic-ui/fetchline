@@ -128,6 +128,7 @@ impl FtpServer {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let u = Arc::clone(&u);
                         let c = Arc::clone(&c);
                         let r = Arc::clone(&r);
@@ -393,6 +394,7 @@ impl NtlmProxyServer {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let t1 = Arc::clone(&t1);
                         let t3 = Arc::clone(&t3);
                         let fwd = Arc::clone(&fwd);

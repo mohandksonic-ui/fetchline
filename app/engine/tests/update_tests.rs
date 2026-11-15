@@ -36,6 +36,7 @@ impl ManifestServer {
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         h.fetch_add(1, Ordering::SeqCst);
                         let mut buf = [0u8; 4096];
                         let _ = stream.read(&mut buf);

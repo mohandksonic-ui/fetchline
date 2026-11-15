@@ -71,6 +71,7 @@ impl GatedPageServer {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let expected = expected.clone();
                         thread::spawn(move || handle_gated_page(stream, &expected));
                     }
@@ -112,6 +113,7 @@ impl OpenPageServer {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let html = html.clone();
                         thread::spawn(move || handle_open_page(stream, &html));
                     }

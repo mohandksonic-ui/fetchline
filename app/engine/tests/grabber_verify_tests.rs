@@ -99,6 +99,7 @@ impl CountSite {
                 while !s.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                             let l = Arc::clone(&l);
                             let h = host.clone();
                             let b = b.clone();

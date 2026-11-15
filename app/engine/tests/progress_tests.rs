@@ -300,17 +300,25 @@ async fn open_folder_validation() {
     let dir = tmpdir();
     let store = Arc::new(Store::open(&dir.join("app.db")).unwrap());
     let mgr = DownloadManager::new(Arc::clone(&store), 4);
+    // BUG-038: the download folder must be a subdirectory of the
+    // tmpdir, not the tmpdir itself — the SQLite database lives in
+    // the tmpdir and stays open for the whole test, so deleting the
+    // tmpdir fails on Windows (error 32, file in use) while Linux
+    // lets you unlink open files. The downloaded file's handle is
+    // closed once the download completes, so deleting the subfolder
+    // works on both platforms.
+    let downloads = dir.join("downloads");
     let (id, _) = mgr
-        .add_download(&server.url, None, Some(dir.to_string_lossy().to_string()), None, None)
+        .add_download(&server.url, None, Some(downloads.to_string_lossy().to_string()), None, None)
         .await
         .unwrap();
     mgr.start_download(&id).await.unwrap();
     assert!(wait_for_status(&mgr, &id, "complete", 30).await);
     let folder = mgr.folder_for_download(&id).unwrap();
-    assert_eq!(folder, dir);
+    assert_eq!(folder, downloads);
     // The folder is deleted after the download finished: the dialog
     // must say so instead of opening nothing.
-    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&downloads).unwrap();
     let err = mgr.folder_for_download(&id).unwrap_err();
     assert!(
         err.to_string().contains("no longer exists"),

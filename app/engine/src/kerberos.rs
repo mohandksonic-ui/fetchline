@@ -3,7 +3,7 @@
 //! What is supported, honestly:
 //! - Plain `http://` downloads and probes through an HTTP proxy that
 //!   demands `Negotiate`, using the system's Kerberos stack: GSSAPI
-//!   (MIT Kerberos, `libgssapi_krb5`) on Linux, SSPI (`Negotiate`
+//!   (MIT Kerberos, `libgssapi_krb5`) on Linux, SSPI (`Kerberos`
 //!   package, `secur32`) on Windows. The SPN is `HTTP/<proxy host>`.
 //!   The token exchange is the standard SPNEGO multi-round handshake
 //!   on one raw TCP connection to the proxy (like the NTLM path in
@@ -640,7 +640,17 @@ mod sspi {
     pub const ISC_REQ_FLAGS: u32 = 0x2 | 0x4 | 0x8;
 }
 
-/// The SSPI initiator: the `Negotiate` package for `HTTP/<proxy host>`.
+/// The SSPI initiator: the `Kerberos` package for `HTTP/<proxy host>`.
+///
+/// BUG-037: this used to ask SSPI for the `Negotiate` package, which
+/// silently falls back to NTLM inside the package when no Kerberos
+/// ticket exists — so on Windows a token was produced (and sent)
+/// with no Kerberos credentials at all, while on Linux the GSSAPI
+/// initiator fails cleanly with no ticket. The setting is Kerberos
+/// and the fallback order (Kerberos -> NTLM -> Basic) is handled at
+/// the scheme level, so ask for the `Kerberos` package directly:
+/// with no ticket `InitializeSecurityContext` fails and no token is
+/// ever sent; with a ticket it produces a real Kerberos AP-REQ.
 #[cfg(target_os = "windows")]
 pub struct SspiInitiator {
     cred: sspi::SecHandle,
@@ -656,7 +666,7 @@ unsafe impl Send for SspiInitiator {}
 impl SspiInitiator {
     pub fn new(proxy_host: &str) -> Result<Self> {
         use sspi::*;
-        let package = std::ffi::CString::new("Negotiate").unwrap();
+        let package = std::ffi::CString::new("Kerberos").unwrap();
         let mut cred = SecHandle { dw_lower: 0, dw_upper: 0 };
         let mut expiry = TimeStamp { dw_low: 0, dw_high: 0 };
         let rc = unsafe {
@@ -674,7 +684,7 @@ impl SspiInitiator {
         };
         if rc != SEC_E_OK {
             return Err(EngineError::InvalidState(format!(
-                "Kerberos (Negotiate) proxy authentication failed: could not acquire the Windows credentials for the Negotiate package (SSPI error 0x{rc:08x}) — check that you are signed in"
+                "Kerberos (Negotiate) proxy authentication failed: could not acquire the Windows credentials for the Kerberos package (SSPI error 0x{rc:08x}) — check that you are signed in"
             )));
         }
         let target = std::ffi::CString::new(format!("HTTP/{proxy_host}")).map_err(|_| {
@@ -741,7 +751,7 @@ impl SpnegoInitiator for SspiInitiator {
             SEC_E_OK => Ok(SpnegoStep { token, complete: true }),
             SEC_I_CONTINUE_NEEDED => Ok(SpnegoStep { token, complete: false }),
             _ => Err(EngineError::InvalidState(format!(
-                "Kerberos (Negotiate) proxy authentication failed: the Windows security package returned SSPI error 0x{rc:08x} — check that you are signed in and that the proxy trusts this account"
+                "Kerberos proxy authentication failed: the Windows security package returned SSPI error 0x{rc:08x} — check that you are signed in and that the proxy trusts this account"
             ))),
         }
     }

@@ -327,6 +327,7 @@ impl NegotiateProxyServer {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let (a, b, c, d, e, f) = (
                             Arc::clone(&a),
                             Arc::clone(&b),
@@ -1042,6 +1043,7 @@ impl CookieGatedOrigin {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         thread::spawn(move || handle_gated(stream));
                     }
                     Err(_) => thread::sleep(Duration::from_millis(5)),

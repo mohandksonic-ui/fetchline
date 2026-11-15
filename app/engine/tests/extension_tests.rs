@@ -668,6 +668,7 @@ impl CookieGatedServer {
             while !stop_flag.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap(); // BUG-036: on Windows an accepted socket inherits the listener's non-blocking mode
                         let seen = Arc::clone(&seen);
                         thread::spawn(move || {
                             handle_cookie_request(stream, require_cookie, &seen);
