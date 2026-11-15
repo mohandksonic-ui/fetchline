@@ -1032,11 +1032,35 @@ fn handle_grabber(mut stream: TcpStream, _base: &str, robots: RobotsMode) {
 }
 
 pub fn tmpdir() -> std::path::PathBuf {
-    // Unique per test: tests run in parallel in one process, so a
-    // PID-only directory would make them share one database and folder.
+    // Unique per test AND per process: tests run in parallel in
+    // one process, so a PID-only directory would make them share
+    // one database and folder — and the counter alone is not
+    // enough either. BUG-040: the counter restarts at 0 in every
+    // test binary, and Windows reuses the PID of an exited
+    // process, so a later binary can compute the exact same
+    // `fetchline-test-{pid}-{n}` path as an earlier binary. When
+    // the earlier binary's test left its directory behind — which
+    // happens on Windows whenever `remove_dir_all` runs while a
+    // spawned task still holds the database open (Windows refuses
+    // to delete open files; Linux unlinks them happily) — the
+    // later test silently opens the STALE app.db and sees the
+    // earlier test's downloads. The nanosecond timestamp makes
+    // the path unique across processes even when the PID is
+    // reused (same precedent as `update_tests.rs`' own tmpdir);
+    // the counter still disambiguates two calls in the same
+    // nanosecond inside one process.
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("fetchline-test-{}-{}", std::process::id(), n));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "fetchline-test-{}-{}-{}",
+        std::process::id(),
+        n,
+        nanos
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

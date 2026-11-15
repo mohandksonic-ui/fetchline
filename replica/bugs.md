@@ -2989,7 +2989,99 @@ engine suite on Linux 413/413 pass. Windows proof is
 the VPS full-suite re-run after the push.
 File: `app/engine/tests/progress_tests.rs` + this log.
 
-## Round 31 — BUG-039: `sync_tick_does_not_fight_a_one_time_drain` races the queue runner's poll loop — 2026-11-15
+## Round 32 — BUG-040: two grabber tests see downloads that do not belong to them — a stale-tmpdir cross-test leak — 2026-11-15
+
+### BUG-040: FIXED — `tmpdir()` could return a directory left behind by an earlier test binary, so a test opened a stale `app.db`
+
+- Severity: S3 (test-only; the Windows-runner failure)
+- Flow / case: `grabber_tests::grabber_completion_action_not_armed_in_explore_only`
+  (tests/grabber_tests.rs:675) and
+  `grabber_tests::grabber_run_fails_when_its_queue_is_gone`
+  (tests/grabber_tests.rs:580) on the GitHub runner
+  (CI run 43722826150, head cd17d4f0): 262 passed, 2 failed
+- Screen: engine tests
+  (`app/engine/tests/grabber_tests.rs`, `tests/common/mock.rs`)
+- Build: 2026-11-15 (found by CI run 43722826150; the same
+  suite passed on the VPS at the same head, 412/412, and
+  grabber 28/28 on the runner one run earlier at head
+  2f02664a)
+
+Steps
+1. On the runner, run `cargo test` in `app/engine`.
+2. Every binary passes except `grabber_tests`, where exactly
+   two tests fail, both on the same assertion:
+   `assert!(mgr.list_downloads().unwrap().is_empty())` —
+   the list holds a download row although the test's own run
+   added none (explore-only downloads nothing; the missing
+   queue fails before crawling anything).
+
+Expected: both tests see an empty download list.
+Actual: on the runner the list is non-empty in both tests,
+while every other assertion in both tests passes
+(files_matched 8, files_downloaded 0, status failed with
+"no longer exists", pages_explored 0).
+
+Root cause: the rows are NOT the grabber's — no code path
+in either test inserts a download (proven by audit: the
+only `INSERT INTO downloads` is `Store::insert_download`,
+reached only through `add_download_with_cookies`, which
+probes first and inserts after; the explore path returns
+before any add, the missing-queue path returns before any
+crawl; `DownloadManager::new` spawns no background task;
+each test has its own fixture site on a random port). The
+rows can only come from ANOTHER test binary's database,
+which means the test opened a database file it did not
+create — i.e. its tmpdir collided with a directory left
+behind by an earlier binary. The chain, each link proven
+from the code:
+- `tests/common/mock.rs::tmpdir()` built the directory as
+  `fetchline-test-{pid}-{n}` with a per-process counter
+  restarting at 0 in every binary. Windows reuses the PID
+  of an exited process, so a later binary can compute the
+  exact same path as an earlier binary's n-th directory.
+- Stale directories DO happen on Windows: every test ends
+  with `let _ = remove_dir_all(&dir)` while spawned tasks
+  (grabber tasks, download tasks, the queue poll loop) may
+  still hold the manager Arc and therefore the SQLite
+  connection open — and Windows refuses to delete open
+  files (error 32; the same mechanism as BUG-038), while
+  Linux unlinks them happily. So earlier binaries leave
+  `fetchline-test-*` directories behind, with populated
+  `app.db` files.
+- `create_dir_all` succeeds on an existing directory and
+  `Store::open` opens the stale database without complaint,
+  so the test silently inherits the earlier test's download
+  rows. Project-level assertions still pass because the
+  project and queue rows are freshly created in that same
+  database — only the download list betrays the leak.
+- This also explains why it never reproduces on Linux
+  (no stale directories) and why it is intermittent on
+  Windows (it needs a PID reuse landing on a stale
+  directory whose downloads table is non-empty — the
+  explore-only test at line 127, with the same assertion,
+  passed in the very same run).
+
+Fix (test-only): `tmpdir()` in `tests/common/mock.rs`
+now builds `fetchline-test-{pid}-{n}-{nanos}` — the
+nanosecond wall-clock timestamp makes the path unique
+across processes even when the PID is reused (same
+precedent as `update_tests.rs`' own tmpdir, which already
+used PID + nanos); the counter still disambiguates two
+calls in the same nanosecond inside one process. A stale
+directory can now never be reopened by a later test. The
+three `list_downloads().is_empty()` assertions in
+`grabber_tests.rs` also print the offending rows on failure
+now, so any future leak names itself instead of failing
+bare. Nothing is weakened: the assertions still require an
+empty list. Regression test kept: the two failing tests
+themselves.
+Verified: `cargo check --tests` 0 warnings; grabber_tests
+5× 28/28; full engine suite 413/413 on Linux. VPS
+verification (full suite --no-fail-fast at the new head,
+plus a leftover-directory count in the VPS TEMP and a
+PID-reuse probe to confirm the mechanism on real Windows)
+to follow; instance stopped after.
+
 
 ### BUG-039: FIXED — the test asserts the drain queue is empty the instant the status flips to "complete", before the runner removes the file
 

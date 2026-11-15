@@ -124,7 +124,14 @@ async fn explore_only_lists_matched_files_without_downloading() {
     assert!(urls.iter().any(|u| u.ends_with("/pic.png")));
     assert!(urls.iter().any(|u| u.ends_with("/archive.zip")));
     assert!(!urls.iter().any(|u| u.ends_with("/secret.pdf"))); // depth 3, not reached
-    assert!(mgr.list_downloads().unwrap().is_empty(), "explore-only must not download");
+    // BUG-040: print the rows on failure — a non-empty list here
+    // used to mean the test opened a stale tmpdir database, and
+    // the bare `is_empty()` gave no clue which rows leaked in.
+    let downloads = mgr.list_downloads().unwrap();
+    assert!(
+        downloads.is_empty(),
+        "explore-only must not download, but the list holds: {downloads:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -577,7 +584,14 @@ async fn grabber_run_fails_when_its_queue_is_gone() {
     let err = done.error_message.unwrap_or_default();
     assert!(err.contains("no longer exists"), "{err}");
     assert_eq!(done.pages_explored, 0, "the run must fail before crawling anything");
-    assert!(mgr.list_downloads().unwrap().is_empty());
+    // BUG-040: print the rows on failure — a non-empty list here
+    // used to mean the test opened a stale tmpdir database, and
+    // the bare `is_empty()` gave no clue which rows leaked in.
+    let downloads = mgr.list_downloads().unwrap();
+    assert!(
+        downloads.is_empty(),
+        "no downloads may exist when the run failed before crawling, but the list holds: {downloads:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -672,7 +686,14 @@ async fn grabber_completion_action_not_armed_in_explore_only() {
     assert_eq!(done.status, "done");
     assert_eq!(done.files_matched, 8);
     assert_eq!(done.files_downloaded, 0);
-    assert!(mgr.list_downloads().unwrap().is_empty());
+    // BUG-040: print the rows on failure — a non-empty list here
+    // used to mean the test opened a stale tmpdir database, and
+    // the bare `is_empty()` gave no clue which rows leaked in.
+    let downloads = mgr.list_downloads().unwrap();
+    assert!(
+        downloads.is_empty(),
+        "explore-only downloaded nothing, but the list holds: {downloads:?}"
+    );
     assert!(
         mgr.pending_action("queue-main").await.is_none(),
         "explore-only downloaded nothing, so nothing may be armed"
