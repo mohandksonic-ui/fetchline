@@ -76,6 +76,20 @@ async fn wait_for_sync(mgr: &DownloadManager, queue_id: &str, secs: u64) -> bool
     false
 }
 
+/// Wait until a queue has no files left (a run finished and the
+/// runner removed them), or the deadline passes.
+async fn wait_for_queue_empty(mgr: &DownloadManager, queue_id: &str, secs: u64) -> bool {
+    for _ in 0..secs * 10 {
+        if let Ok(files) = mgr.list_queue_files(queue_id) {
+            if files.is_empty() {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
 /// Wait until a server has served more HEAD probes than `before`.
 async fn wait_for_head_growth(server: &MockServer, before: usize, secs: u64) -> bool {
     for _ in 0..secs * 10 {
@@ -466,6 +480,14 @@ async fn sync_tick_does_not_fight_a_one_time_drain() {
     mgr.scheduler_tick_at(now_unix()).await.unwrap();
     assert!(wait_for_sync(&mgr, &queue, 30).await);
     assert!(wait_for_status(&mgr, &pending, "complete", 30).await);
+    // BUG-039: "complete" and "removed from the queue" are two
+    // separate steps — the download task flips the status, and only
+    // the queue runner's 200 ms poll loop removes the file
+    // afterwards. Asserting emptiness the instant the status flips
+    // races the runner's next tick, so wait for the removal to land
+    // (same pattern as the finished-file drain wait in
+    // engine_tests.rs) before asserting.
+    assert!(wait_for_queue_empty(&mgr, &drain.id, 30).await);
     assert!(mgr.list_queue_files(&drain.id).unwrap().is_empty(), "the one-time drain still empties its queue");
     assert_eq!(mgr.list_queue_files(&queue).unwrap().len(), 1, "the sync queue keeps its files");
 }

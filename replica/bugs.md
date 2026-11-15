@@ -2989,6 +2989,66 @@ engine suite on Linux 413/413 pass. Windows proof is
 the VPS full-suite re-run after the push.
 File: `app/engine/tests/progress_tests.rs` + this log.
 
+## Round 31 — BUG-039: `sync_tick_does_not_fight_a_one_time_drain` races the queue runner's poll loop — 2026-11-15
+
+### BUG-039: FIXED — the test asserts the drain queue is empty the instant the status flips to "complete", before the runner removes the file
+
+- Severity: S3 (test-only; the single remaining Windows failure)
+- Flow / case: `sync_tests::sync_tick_does_not_fight_a_one_time_drain`
+  on the GitHub runner (CI run 43717398945, head 2f02664a):
+  371 passed, 1 failed
+- Screen: engine tests
+  (`app/engine/tests/sync_tests.rs`)
+- Build: 2026-11-15 (found by CI run 43717398945; the same
+  test passed on the VPS at the same head, 23/23 sync_tests)
+
+Steps
+1. On the runner, run `cargo test` in `app/engine`.
+2. Every binary passes except `sync_tests`, where exactly
+   one test fails:
+   `sync_tick_does_not_fight_a_one_time_drain` panics at
+   `tests\sync_tests.rs:469:5` — "the one-time drain still
+   empties its queue", `assertion failed: queue.is_empty()`.
+
+Expected: after the drain download reaches "complete", the
+one-time queue is empty.
+Actual: on the runner the queue still holds the file when the
+assertion runs, even though the download is complete.
+
+Root cause: "complete" and "removed from the queue" are two
+separate steps done by two different tasks. The download
+task flips the status with `mark_complete(id)`; the queue
+membership is cleared only by the `run_queue` poll loop
+(`src/manager.rs`, inner loop sleeps 200 ms per iteration),
+which calls `remove_from_queue` after it observes
+"complete". The test's `wait_for_status` polls every 100 ms
+and returns the instant it sees "complete" — so on a loaded
+2-vCPU runner the test's poller can win the race and assert
+emptiness up to ~200 ms (plus scheduling delay) before the
+runner's next tick removes the file. The scheduler tick is
+exonerated: it skips queues that are already draining and
+only spawns the sync for the periodic queue — it never
+touches the drain queue. The first VPS run's 10053 symptom
+on this same test was the BUG-036 stub issue, a different
+mechanism already fixed.
+
+Fix (test-only): the test now waits for the drain queue to
+actually empty before asserting — new `wait_for_queue_empty`
+helper (100 ms polls, 30 s deadline, same style as the
+file's `wait_for_sync` / `wait_for_status`), then the
+original assertion with its original message, unchanged.
+This is the same pattern the codebase already uses for
+exactly this situation (the finished-file drain wait in
+`engine_tests.rs`). Nothing is weakened: the assertion
+still requires an empty queue, and the test still fails if
+the drain genuinely does not empty it within 30 s.
+Regression test kept: the failing test itself.
+Verified: `cargo check --tests` 0 warnings; sync_tests
+run 5 times consecutively on Linux, all green; full engine
+suite on Linux 413/413 pass. Windows proof is the VPS
+full-suite re-run after the push.
+File: `app/engine/tests/sync_tests.rs` + this log.
+
 ## Known limitations, not bugs (round-24 additions)
 
 - The Tauri shell never compiles or runs on this VM, so a
