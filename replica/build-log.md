@@ -2332,3 +2332,22 @@ check and download quota untouched, as instructed.
   recursive MSI lookup). No PowerShell exists on this VM — the script is
   reviewed-only; the CI run is the proof. No product code changed, no
   engine tests touched. Licence (S11) untouched.
+
+## Smoke-test v1 run — FAILED at the install step, app never launched (2026-11-15)
+- Run 43684788098 (head 8d4d1f78, user's manual workflow upload): build job
+  SUCCESS, smoke-test job FAILED in 10 s. Step 3 "Install MSI and launch
+  Fetchline" died in 2 s at the msiexec line: `& msiexec.exe` returned with
+  `$LASTEXITCODE` BLANK (not 0, not an error code), so the script's
+  `if ($LASTEXITCODE -ne 0)` check threw "MSI install failed (exit code )".
+  install.log was empty/missing (its tail printed nothing). The app was
+  NEVER launched, the 30 s wait never happened, no startup.log was produced.
+  So v1 proved NOTHING about the app or the BUG-029 fix — the harness broke
+  before the test. Root cause (script bug, not app bug): msiexec is a
+  GUI-subsystem app and `&` does not reliably wait for it or set
+  `$LASTEXITCODE` in non-interactive pwsh.
+- Fix (v2, in `.github/workflows/build-windows.yml`, ready for manual
+  upload — the connector cannot push workflow files): install via
+  `Start-Process -FilePath 'msiexec.exe' -ArgumentList ... -Wait -PassThru`
+  and check `.ExitCode` (null or non-zero = fail, with the install.log tail
+  printed). Everything else in the step is unchanged (the startup.log path
+  was already correct: `$env:APPDATA\com.fetchline.app\fetchline\startup.log`).
