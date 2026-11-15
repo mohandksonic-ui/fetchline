@@ -14,6 +14,11 @@
 #   on Linux in development (410/410), and the Windows run is a smoke check —
 #   a Windows-only test failure must not block producing an installer, but it
 #   still shows up as a failed (orange) step in the run.
+# - The smoke-test job below installs the freshly built MSI on the runner,
+#   launches the app, and checks it stays alive with a clean startup.log.
+#   It exists because BUG-029 (setup called tokio::spawn outside any Tokio
+#   runtime, so the app flashed blank and died) was only ever caught on the
+#   user's PC — a green build alone does not prove the app launches.
 
 name: Build Windows installer
 
@@ -71,3 +76,104 @@ jobs:
             app/src-tauri/target/release/bundle/msi/*.msi
             app/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
+
+  # Launch smoke test: install the MSI this run just built, run the app,
+  # and prove it stays alive with a clean startup.log. This is the check
+  # that would have caught BUG-029 (blank window, immediate close) before
+  # any user ever installed the app. Runs on every push, after the build.
+  smoke-test:
+    needs: build-windows
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fetchline-windows-installer
+          path: installer
+
+      - name: Install MSI and launch Fetchline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 1. Locate the MSI inside the downloaded artifact
+          #    (layout is installer/msi/<name>.msi; search recursively so a
+          #    future layout change does not silently break this step).
+          $msi = Get-ChildItem -Path installer -Filter *.msi -Recurse | Select-Object -First 1
+          if (-not $msi) { throw "No MSI found under installer/" }
+          Write-Host "Installing MSI: $($msi.FullName)"
+
+          # 2. Silent install; fail the step if msiexec reports an error.
+          & msiexec.exe /i "$($msi.FullName)" /quiet /norestart /log "$env:GITHUB_WORKSPACE\install.log"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "msiexec failed with exit code $LASTEXITCODE"
+            Get-Content "$env:GITHUB_WORKSPACE\install.log" -Tail 50 -ErrorAction SilentlyContinue
+            throw "MSI install failed (exit code $LASTEXITCODE)"
+          }
+          Write-Host "MSI installed OK"
+
+          # 3. Launch the app and give it 30 s to start.
+          $exe = 'C:\Program Files\Fetchline\fetchline.exe'
+          if (-not (Test-Path $exe)) { throw "fetchline.exe not found at $exe" }
+          $proc = Start-Process -FilePath $exe -PassThru
+          Write-Host "Launched fetchline, PID $($proc.Id)"
+          Start-Sleep -Seconds 30
+
+          # 4. Is the process still alive?
+          $alive = Get-Process -Name fetchline -ErrorAction SilentlyContinue
+          $stillRunning = ($null -ne $alive) -and (-not $proc.HasExited)
+          Write-Host "Process alive after 30s: $stillRunning"
+          if ($alive) { Write-Host "MainWindowTitle: '$($alive.MainWindowTitle)'" }
+
+          # 5. Read the startup log (the diagnosis) and copy it to the
+          #    workspace so the upload step can publish it.
+          $logPath = Join-Path $env:APPDATA 'com.fetchline.app\fetchline\startup.log'
+          $logOk = $false
+          $backendReached = $false
+          if (Test-Path $logPath) {
+            $content = Get-Content $logPath -Raw
+            Write-Host "===== startup.log ($logPath) ====="
+            Write-Host $content
+            Write-Host "===== end startup.log ====="
+            Copy-Item $logPath "$env:GITHUB_WORKSPACE\startup.log" -Force
+            $logOk = $content -match 'setup ok'
+            $backendReached = $content -match 'frontend reached backend'
+            Write-Host "startup.log contains 'setup ok': $logOk"
+            Write-Host "startup.log contains 'frontend reached backend': $backendReached"
+          } else {
+            Write-Host "startup.log NOT FOUND at $logPath"
+          }
+
+          # 6. Desktop screenshot (best-effort only — never fails the step;
+          #    the process-alive check and the log are the decisive signals).
+          try {
+            Add-Type -AssemblyName System.Windows.Forms
+            Add-Type -AssemblyName System.Drawing
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+            $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+            $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $bmp.Save("$env:GITHUB_WORKSPACE\smoke-screenshot.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $gfx.Dispose(); $bmp.Dispose()
+            Write-Host "Screenshot saved: smoke-screenshot.png"
+          } catch {
+            Write-Host "Screenshot failed (non-fatal): $($_.Exception.Message)"
+          }
+
+          # 7. Verdict, then always stop the app so the job ends cleanly.
+          Stop-Process -Name fetchline -Force -ErrorAction SilentlyContinue
+          if (-not $stillRunning) { throw "SMOKE TEST FAILED: fetchline process is not alive after 30s" }
+          if (-not $logOk) { throw "SMOKE TEST FAILED: startup.log missing or does not contain 'setup ok'" }
+          Write-Host "SMOKE TEST PASSED: process alive and startup.log contains 'setup ok'"
+
+      - name: Upload smoke-test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetchline-smoke-test
+          path: |
+            startup.log
+            smoke-screenshot.png
+            install.log
+          if-no-files-found: warn
