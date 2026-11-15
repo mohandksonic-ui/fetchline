@@ -10,10 +10,11 @@
 # - Icon PNG/ICO files are binary and are not stored in the repo; they are
 #   regenerated here from the project's own artwork (scripts/generate-icons.py)
 #   and then expanded into the Tauri set with `tauri icon`.
-# - The engine test step runs with continue-on-error: the suite is verified
-#   on Linux in development (410/410), and the Windows run is a smoke check —
-#   a Windows-only test failure must not block producing an installer, but it
-#   still shows up as a failed (orange) step in the run.
+# - The engine test step FAILS the run on failure (no
+#   continue-on-error): BUG-031 proved the suite did not compile on
+#   Windows while the step was continue-on-error, so the break stayed
+#   hidden — a Windows-only compile/test failure must fail the run
+#   visibly now.
 # - EXCEPTION: the real-download test (real_download_tests.rs) runs in its
 #   own step WITHOUT continue-on-error — it downloads a pinned file from
 #   the real internet through the real engine and verifies the bytes, so
@@ -28,9 +29,11 @@
 #   Native Messaging frames, loads the unpacked extension in headless
 #   Chrome and checks the popup reports a connection, then lets the app
 #   drain the queue and verifies the downloaded file byte-for-byte.
-#   NOTE the packaging gap it works around: the MSI ships NO
-#   fetchline-host.exe and creates NO native-messaging registry key, so
-#   the job builds the host and registers it itself (runner-only).
+#   It tests the GENUINE installed path: the MSI now ships
+#   fetchline-host.exe and writes the native-messaging registry keys
+#   (bundle.externalBin + resources + NSIS hooks / WiX fragment), so
+#   the job reads the installed key + manifest instead of building
+#   and registering a host itself.
 
 name: Build Windows installer
 
@@ -59,7 +62,9 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: app/src-tauri
+          workspaces: |
+            app/src-tauri
+            app/host
 
       - name: Install frontend dependencies
         working-directory: app
@@ -73,15 +78,15 @@ jobs:
 
       - name: Engine tests (smoke check)
         working-directory: app/engine
-        continue-on-error: true
         run: cargo test
 
-      # Real download test — NO continue-on-error: it downloads a pinned
-      # file from the real internet through the real engine and verifies
-      # the bytes, so a failure here must fail the run. (The step above
-      # runs the whole suite with continue-on-error and must stay that
-      # way; this step is the hard gate for the one test that proves
-      # downloading works on Windows.) The env var turns the tests on:
+      # Real download test — the hard gate for the one test that proves
+      # downloading works on Windows: it downloads a pinned file from
+      # the real internet through the real engine and verifies the
+      # bytes, so a failure here must fail the run. (The step above now
+      # also fails the run — BUG-031 — but it only runs the suite
+      # against local fixtures; this step is the only one that touches
+      # the real internet.) The env var turns the tests on:
       # without it they print SKIPPED and pass (the Linux dev VM sits
       # behind a TLS-intercepting proxy the engine's rustls client
       # rejects — see real_download_tests.rs; the runner has direct
@@ -91,6 +96,25 @@ jobs:
         env:
           FETCHLINE_REAL_DOWNLOAD_TEST: "1"
         run: cargo test --test real_download_tests
+
+      # Build the native-messaging host and stage it where Tauri looks
+      # for external binaries: app/src-tauri/binaries/
+      # fetchline-host-x86_64-pc-windows-msvc.exe (bundle.externalBin
+      # "binaries/fetchline-host" in tauri.conf.json). The MSI/NSIS
+      # installers then ship it next to fetchline.exe and register it
+      # with the browsers — without this step the installer has no host
+      # and browser capture cannot work for a user install (that was
+      # the packaging gap). The host crate lives in app/host and is NOT
+      # a dependency of the Tauri app, so `tauri build` alone never
+      # builds it; it must be built here, before the installer step.
+      - name: Build fetchline-host (external binary)
+        working-directory: app/host
+        shell: pwsh
+        run: |
+          cargo build --release -p fetchline-host
+          New-Item -ItemType Directory -Force -Path ..\src-tauri\binaries | Out-Null
+          Copy-Item target\release\fetchline-host.exe ..\src-tauri\binaries\fetchline-host-x86_64-pc-windows-msvc.exe
+          Get-ChildItem ..\src-tauri\binaries
 
       - name: Build Windows installer (MSI + NSIS)
         working-directory: app
@@ -222,18 +246,18 @@ jobs:
   #      Messaging frames, enqueues a link into the app's real app.db
   #      (row verified in SQLite).
   #   2. browser: the unpacked extension loads in headless Chrome; its
-  #      ID is discovered, the host manifest + registry key are written
-  #      as a user install would, and popup.html is opened and polled
+  #      ID is discovered and checked against the stable id from
+  #      manifest.json's key, the INSTALLED registry key + host manifest
+  #      are read back and verified (they must point at the installed
+  #      host with the stable id), and popup.html is opened and polled
   #      over CDP until it reports "Connected to the Fetchline desktop
   #      app".
   #   3. drain: the installed app drains the queue and downloads the
   #      pinned file; the script verifies its SHA-256.
-  # PACKAGING GAP (finding, not a workaround to hide): the MSI ships no
-  # fetchline-host.exe and creates no native-messaging registry key —
-  # tauri.conf.json has no bundle config for either — so this job builds
-  # the host from source and registers it itself, runner-only. Until the
-  # installer ships the host + key, a user install cannot capture from
-  # a browser at all, however green this job is.
+  # This job depends on the MSI from build-windows: the host binary and
+  # the registry keys it tests are the ones the installer ships and
+  # writes (bundle.externalBin + resources + NSIS hooks / WiX fragment).
+  # It no longer builds or registers a host itself.
   # What it does NOT prove: a human right-click ("Download with
   # Fetchline") or the download watcher cannot be driven in headless
   # Chrome — no mouse, no real popup window. Those use the same
@@ -246,14 +270,6 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v4
-
-      - name: Set up Rust (stable, MSVC)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo build (host)
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: app/host
 
       - name: Download installer artifact
         uses: actions/download-artifact@v4
@@ -296,10 +312,6 @@ jobs:
           if (-not (Test-Path $db)) { throw "app.db not found at $db after first launch" }
           Write-Host "app.db exists: $db"
 
-      - name: Build fetchline-host
-        working-directory: app/host
-        run: cargo build --release -p fetchline-host
-
       - name: Install capture-test dependencies
         run: python -m pip install websocket-client
 
@@ -307,7 +319,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          python scripts/capture-test.py --host-exe "$env:GITHUB_WORKSPACE\app\host\target\release\fetchline-host.exe" --db-path "$env:APPDATA\com.fetchline.app\fetchline\app.db" --extension-dir "$env:GITHUB_WORKSPACE\app\extension" --chrome-exe 'C:\Program Files\Google\Chrome\Application\chrome.exe' --app-exe 'C:\Program Files\Fetchline\fetchline.exe' --url 'https://raw.githubusercontent.com/mohandksonic-ui/fetchline/7255dff9ec2863b16bda2772a839654b51274c32/LICENSE' --expected-sha256 'c2ef3696eecd8d51c0e615afe9437e5d620abcd9272b9d9f4bcbbd1e4a95f793' --downloads-dir "$env:USERPROFILE\Downloads"
+          # The host + registry key under test are the ones the MSI
+          # installed (C:\Program Files\Fetchline\fetchline-host.exe);
+          # the script reads the installed key + manifest and verifies
+          # them instead of registering its own.
+          python scripts/capture-test.py --host-exe 'C:\Program Files\Fetchline\fetchline-host.exe' --db-path "$env:APPDATA\com.fetchline.app\fetchline\app.db" --extension-dir "$env:GITHUB_WORKSPACE\app\extension" --chrome-exe 'C:\Program Files\Google\Chrome\Application\chrome.exe' --app-exe 'C:\Program Files\Fetchline\fetchline.exe' --url 'https://raw.githubusercontent.com/mohandksonic-ui/fetchline/7255dff9ec2863b16bda2772a839654b51274c32/LICENSE' --expected-sha256 'c2ef3696eecd8d51c0e615afe9437e5d620abcd9272b9d9f4bcbbd1e4a95f793' --downloads-dir "$env:USERPROFILE\Downloads"
 
       - name: Upload capture-test evidence
         if: always()
